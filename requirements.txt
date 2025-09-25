@@ -1,9 +1,0 @@
-wget
-datasets
-torch
-transformers
-rank_bm25
-nltk
-sentence_transformers
-seaborn
-accelerate
