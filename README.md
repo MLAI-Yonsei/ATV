@@ -44,7 +44,6 @@ Running the above script enables evaluation of performance on each individual da
 
 #### Batch options (Evaluation)
 - `--batch_size N`: Batches N samples for GPT-2 and LLaMA forward simultaneously.
-- `batch_size=1`: identical to original. `batch_size>1`: faster with minor fp16 differences (no training trajectory issue since eval-only).
 
 ```bash
 python ATV_evaluate.py ... --batch_size 4
