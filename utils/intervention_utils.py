@@ -61,7 +61,11 @@ def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 
 
 def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weight_fv=1.0, weight_ori=0, norm=False):
     """
-    Adds a vector to the output of a specified layer in the model
+    Adds a vector to the output of a specified layer in the model.
+
+    Supports batched fv_vector:
+      - [n_layers, hidden] : single sample (original behavior)
+      - [B, n_layers, hidden] : batched, per-sample vectors
 
     Returns:
     add_act: a function specifying how to add a function vector to a layer's output hidden states
@@ -71,12 +75,17 @@ def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weigh
         current_layer = int(layer_name.split(".")[2])
         if isinstance(edit_layer, int):
             edit_layer = [edit_layer]
-       
+
+        batched = fv_vector.dim() == 3  # [B, n_layers, hidden]
+
         if len(edit_layer) > 1:
-            intert_fv = fv_vector[current_layer].unsqueeze(0).clone()
+            if batched:
+                intert_fv = fv_vector[:, current_layer, :].unsqueeze(1).clone()  # [B, 1, hidden]
+            else:
+                intert_fv = fv_vector[current_layer].unsqueeze(0).clone()  # [1, hidden]
         else:
             intert_fv = fv_vector.clone()
-        # fv all layers [32, 4096]
+        # fv all layers [32, 4096] or [B, 32, 4096]
         # one layer [1, 4096]
         if current_layer in edit_layer:
             if isinstance(output, tuple):
@@ -107,7 +116,7 @@ def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weigh
                     output[:, idx] = normalized_vector
                 else:
                     output[:, idx] =  weight_ori * output[:, idx] + weight_fv * intert_fv .to(output.device) #intert_fv.to(output.device)
-    
+
                 return output
         else:
             return output

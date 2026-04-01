@@ -1041,12 +1041,12 @@ class Retrieve_Evaluator:
 
     def adaptive_training(self):
         print("Loading ICV dataset...")
-        
+
         train_split, valid_split, test_split = self.dataset['train'], self.dataset['valid'], self.dataset['test']
-        
+
         # Simple template for vector generation
         vector_template = "Q: {input} \n A: "
-        
+
         # Cache templates by dataset to prevent duplicate loading
         template_cache = {}
 
@@ -1061,14 +1061,14 @@ class Retrieve_Evaluator:
             if len(query_text) > 3500:
                 print(f"Skipping train example {i} due to excessive length: {len(query_text)} chars")
                 continue
-            
+
             # Get dataset name
             dataset_name = word_pairs_test.get('dataset_name', self.args.dataset_name)
-            
+
             # Get from template cache or load new
             if dataset_name not in template_cache:
                 template_cache[dataset_name] = self.load_templates(dataset_name)
-            
+
             # Store data and template together
             train_data.append((query_text, target, word_pairs_test, template_cache[dataset_name]))
 
@@ -1079,22 +1079,22 @@ class Retrieve_Evaluator:
             if len(query_text) > 3500:
                 print(f"Skipping valid example {i} due to excessive length: {len(query_text)} chars")
                 continue
-            
+
             dataset_name = word_pairs_test.get('dataset_name', self.args.dataset_name)
             if dataset_name not in template_cache:
                 template_cache[dataset_name] = self.load_templates(dataset_name)
-            
+
             val_data.append((query_text, target, word_pairs_test, template_cache[dataset_name]))
 
         # Process test data the same way
         for i in range(len(test_split)):
             word_pairs_test = test_split[i]
             query_text, target = self.prepare_query_text(word_pairs_test, vector_template)
-            
+
             dataset_name = word_pairs_test.get('dataset_name', self.args.dataset_name)
             if dataset_name not in template_cache:
                 template_cache[dataset_name] = self.load_templates(dataset_name)
-            
+
             test_data.append((query_text, target, word_pairs_test, template_cache[dataset_name]))
 
         print(f"After filtering: {len(train_data)} train, {len(val_data)} validation, {len(test_data)} test examples")
@@ -1102,31 +1102,35 @@ class Retrieve_Evaluator:
         # Model initialization (same as before)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
         gpt2_model = GPT2Model.from_pretrained("gpt2").to(device)
         gpt2_model.train()
         llama_model = self.model
         llama_tokenizer = self.tokenizer
+        llama_tokenizer.padding_side = "left"
         llama_model.eval()
         for param in llama_model.parameters():
             param.requires_grad = False
-        gpt2_hidden_size = gpt2_model.config.hidden_size    
-        llama_hidden_size = llama_model.config.hidden_size    
+        gpt2_hidden_size = gpt2_model.config.hidden_size
+        llama_hidden_size = llama_model.config.hidden_size
         llama_num_layers = llama_model.config.num_hidden_layers
         projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers).to(device)
         projection_layer.train()
         optimizer = optim.Adam(
-            list(gpt2_model.parameters()) + list(projection_layer.parameters()), 
+            list(gpt2_model.parameters()) + list(projection_layer.parameters()),
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay
         )
-        
+
+        batch_size = self.args.batch_size
+
         ####################################
         # Training & Validation Loop
         ####################################
         import time
         from datetime import timedelta
 
-        print("Training...")
+        print(f"Training... (batch_size={batch_size})")
         num_epochs = self.args.epochs
         train_loss_lst = []
         val_loss_lst = []
@@ -1142,65 +1146,137 @@ class Retrieve_Evaluator:
             projection_layer.train()
 
             with torch.enable_grad():
-                for vector_input_text, target_text, word_pairs_test, templates in train_data:
-                    optimizer.zero_grad()
-                    
-                    # 1. Vector generation
-                    gpt2_inputs = gpt2_tokenizer(vector_input_text, return_tensors="pt").to(device)
-                    gpt2_outputs = gpt2_model(**gpt2_inputs)
-                    gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-                    
-                    # 2. Vector expansion
-                    projected_vector = projection_layer(gpt2_last_token)
-                    layer_vectors = projected_vector.view(llama_num_layers, llama_hidden_size)
-                    
-                    # Calculate loss with various templates
-                    batch_loss = 0.0
-                    valid_templates = [t for t in templates if t is not None]
-                    
-                    # Use default template if no valid templates exist
-                    if not valid_templates:
-                        valid_templates = [None]  # Use default format
-                        
-                    for template in valid_templates:
-                        # Create input for each template
-                        inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                        combined_text = inference_query_text + target_text
-                        
-                        # Tokenize and set labels
-                        llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
-                        input_ids = llama_inputs.input_ids
-                        prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
-                        prompt_len = prompt_ids.shape[1]
-                        
-                        labels = input_ids.clone()
-                        labels[:, :prompt_len] = -100
-                        llama_inputs["labels"] = labels
+                # Process train_data in batches
+                for batch_start in range(0, len(train_data), batch_size):
+                    batch_end = min(batch_start + batch_size, len(train_data))
+                    current_batch = train_data[batch_start:batch_end]
+                    B = len(current_batch)
 
-                        # Apply intervention
+                    optimizer.zero_grad()
+
+                    # 1. Batched GPT-2 forward
+                    gpt2_texts = [item[0] for item in current_batch]
+                    gpt2_inputs = gpt2_tokenizer(gpt2_texts, return_tensors="pt", padding=True).to(device)
+                    gpt2_outputs = gpt2_model(**gpt2_inputs)
+                    # Extract last real token per sample
+                    gpt2_lengths = gpt2_inputs.attention_mask.sum(dim=1) - 1  # [B]
+                    gpt2_last_tokens = gpt2_outputs.last_hidden_state[torch.arange(B), gpt2_lengths]  # [B, 768]
+
+                    # 2. Batched projection
+                    projected_vectors = projection_layer(gpt2_last_tokens)  # [B, 32*4096]
+                    all_layer_vectors = projected_vectors.view(B, llama_num_layers, llama_hidden_size)  # [B, 32, 4096]
+
+                    # 3. LLaMA forward with intervention
+                    if self.args.llama_batch:
+                        # Batched: flatten (sample × template) pairs for one LLaMA forward
+                        all_combined_texts = []
+                        all_prompt_lens = []
+                        all_n_templates = []
+
+                        for sample_idx in range(B):
+                            vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
+                            valid_templates = [t for t in templates if t is not None]
+                            if not valid_templates:
+                                valid_templates = [None]
+                            all_n_templates.append(len(valid_templates))
+
+                            for template in valid_templates:
+                                inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
+                                combined_text = inference_query_text + target_text
+                                prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids
+                                all_combined_texts.append(combined_text)
+                                all_prompt_lens.append(prompt_ids.shape[1])
+
+                        N = len(all_combined_texts)
+                        llama_inputs = llama_tokenizer(all_combined_texts, return_tensors="pt", padding=True).to(device)
+
+                        labels = llama_inputs.input_ids.clone()
+                        pad_lens = (llama_inputs.attention_mask == 0).sum(dim=1)
+                        for i in range(N):
+                            labels[i, :pad_lens[i] + all_prompt_lens[i]] = -100
+
+                        expanded_vectors = all_layer_vectors.repeat_interleave(
+                            torch.tensor(all_n_templates, device=device), dim=0)
+
                         edit_layers = list(range(self.model_config["n_layers"]))
-                        intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
+                        intervention_fn = add_function_vector(edit_layers, expanded_vectors,
+                            device=self.model.device, idx=-1,
+                            weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False)
 
                         with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
                             outputs = llama_model(**llama_inputs)
-                        
-                        # Accumulate loss for each template
-                        batch_loss += outputs.loss
 
                         logits = outputs.logits
-                        next_token_logits = logits[:, prompt_len-1, :]   # [1, V]
-                        preds = next_token_logits.argmax(dim=-1)
-                        
-                        true_id = llama_inputs["labels"][:, prompt_len]
-                        correct = (preds == true_id).sum().item()
-                        epoch_train_correct += correct
-                        epoch_train_total += 1
+                        vocab_size = logits.size(-1)
+                        shift_logits = logits[:, :-1, :].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
 
-                    # Average by number of templates
-                    loss = batch_loss / len(valid_templates)
+                        ce = F.cross_entropy(
+                            shift_logits.view(-1, vocab_size), shift_labels.view(-1),
+                            ignore_index=-100, reduction='none').view(N, -1)
+                        valid_tokens = (shift_labels != -100).float()
+                        per_seq_loss = (ce * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1)
+
+                        acc_positions = pad_lens + torch.tensor(all_prompt_lens, device=device) - 1
+                        label_positions = pad_lens + torch.tensor(all_prompt_lens, device=device)
+                        next_token_logits = logits[torch.arange(N, device=device), acc_positions]
+                        true_ids = labels[torch.arange(N, device=device), label_positions]
+                        epoch_train_correct += (next_token_logits.argmax(dim=-1) == true_ids).sum().item()
+                        epoch_train_total += N
+
+                        batch_loss = 0.0
+                        offset = 0
+                        for sample_idx in range(B):
+                            nt = all_n_templates[sample_idx]
+                            batch_loss += per_seq_loss[offset:offset + nt].sum() / nt
+                            offset += nt
+
+                    else:
+                        # Sequential: per-sample, per-template LLaMA forward (original behavior)
+                        batch_loss = 0.0
+                        for sample_idx in range(B):
+                            vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
+                            layer_vectors = all_layer_vectors[sample_idx]
+
+                            valid_templates = [t for t in templates if t is not None]
+                            if not valid_templates:
+                                valid_templates = [None]
+
+                            sample_loss = 0.0
+                            for template in valid_templates:
+                                inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
+                                combined_text = inference_query_text + target_text
+
+                                llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
+                                input_ids = llama_inputs.input_ids
+                                prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
+                                prompt_len = prompt_ids.shape[1]
+
+                                labels = input_ids.clone()
+                                labels[:, :prompt_len] = -100
+                                llama_inputs["labels"] = labels
+
+                                edit_layers = list(range(self.model_config["n_layers"]))
+                                intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
+
+                                with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
+                                    outputs = llama_model(**llama_inputs)
+
+                                sample_loss += outputs.loss
+
+                                logits = outputs.logits
+                                next_token_logits = logits[:, prompt_len-1, :]
+                                preds = next_token_logits.argmax(dim=-1)
+                                true_id = llama_inputs["labels"][:, prompt_len]
+                                epoch_train_correct += (preds == true_id).sum().item()
+                                epoch_train_total += 1
+
+                            batch_loss += sample_loss / len(valid_templates)
+
+                    loss = batch_loss / B
                     loss.backward()
                     optimizer.step()
-                    total_loss += loss.item()
+                    total_loss += loss.item() * B
 
                 avg_train_loss = total_loss / len(train_data)
                 train_loss_lst.append(avg_train_loss)
@@ -1213,67 +1289,133 @@ class Retrieve_Evaluator:
                 gpt2_model.eval()
                 projection_layer.eval()
                 llama_model.eval()
-                
+
                 total_val_loss = 0.0
 
                 epoch_val_correct = 0
                 epoch_val_total = 0
-                
-                with torch.no_grad():
-                    for vector_input_text, target_text, word_pairs_test, templates in val_data:
-                        # 1. Vector generation
-                        gpt2_inputs = gpt2_tokenizer(vector_input_text, return_tensors="pt").to(device)
-                        gpt2_outputs = gpt2_model(**gpt2_inputs)
-                        gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-                        
-                        # 2. Vector expansion
-                        projected_vector = projection_layer(gpt2_last_token)
-                        layer_vectors = projected_vector.view(llama_num_layers, llama_hidden_size)
-                        
-                        # Calculate validation loss with various templates
-                        batch_val_loss = 0.0
-                        valid_templates = [t for t in templates if t is not None]
-                        
-                        # Use default template if no valid templates exist
-                        if not valid_templates:
-                            valid_templates = [None]  # Use default format
-                            
-                        for template in valid_templates:
-                            # Create input for each template
-                            inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                            combined_text = inference_query_text + target_text
-                            
-                            # Tokenize and set labels
-                            llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
-                            input_ids = llama_inputs.input_ids
-                            prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
-                            prompt_len = prompt_ids.shape[1]
-                            
-                            labels = input_ids.clone()
-                            labels[:, :prompt_len] = -100
-                            llama_inputs["labels"] = labels
 
-                            # Apply intervention
+                with torch.no_grad():
+                    for batch_start in range(0, len(val_data), batch_size):
+                        batch_end = min(batch_start + batch_size, len(val_data))
+                        current_batch = val_data[batch_start:batch_end]
+                        B = len(current_batch)
+
+                        # 1. Batched GPT-2 forward
+                        gpt2_texts = [item[0] for item in current_batch]
+                        gpt2_inputs = gpt2_tokenizer(gpt2_texts, return_tensors="pt", padding=True).to(device)
+                        gpt2_outputs = gpt2_model(**gpt2_inputs)
+                        gpt2_lengths = gpt2_inputs.attention_mask.sum(dim=1) - 1
+                        gpt2_last_tokens = gpt2_outputs.last_hidden_state[torch.arange(B), gpt2_lengths]
+
+                        # 2. Batched projection
+                        projected_vectors = projection_layer(gpt2_last_tokens)
+                        all_layer_vectors = projected_vectors.view(B, llama_num_layers, llama_hidden_size)
+
+                        # 3. LLaMA forward with intervention
+                        if self.args.llama_batch:
+                            # Batched
+                            all_combined_texts = []
+                            all_prompt_lens = []
+                            all_n_templates = []
+
+                            for sample_idx in range(B):
+                                vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
+                                valid_templates = [t for t in templates if t is not None]
+                                if not valid_templates:
+                                    valid_templates = [None]
+                                all_n_templates.append(len(valid_templates))
+
+                                for template in valid_templates:
+                                    inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
+                                    combined_text = inference_query_text + target_text
+                                    prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids
+                                    all_combined_texts.append(combined_text)
+                                    all_prompt_lens.append(prompt_ids.shape[1])
+
+                            N = len(all_combined_texts)
+                            llama_inputs = llama_tokenizer(all_combined_texts, return_tensors="pt", padding=True).to(device)
+
+                            labels = llama_inputs.input_ids.clone()
+                            pad_lens = (llama_inputs.attention_mask == 0).sum(dim=1)
+                            for i in range(N):
+                                labels[i, :pad_lens[i] + all_prompt_lens[i]] = -100
+
+                            expanded_vectors = all_layer_vectors.repeat_interleave(
+                                torch.tensor(all_n_templates, device=device), dim=0)
+
                             edit_layers = list(range(self.model_config["n_layers"]))
-                            intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
+                            intervention_fn = add_function_vector(edit_layers, expanded_vectors,
+                                device=self.model.device, idx=-1,
+                                weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False)
 
                             with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
                                 outputs = llama_model(**llama_inputs)
-                            
-                            # Accumulate loss for each template
-                            batch_val_loss += outputs.loss
 
                             logits = outputs.logits
-                            next_token_logits = logits[:, prompt_len-1, :]   # [1, V]
-                            preds = next_token_logits.argmax(dim=-1)
-                            
-                            true_id = llama_inputs["labels"][:, prompt_len]
-                            correct = (preds == true_id).sum().item()
-                            epoch_val_correct += correct
-                            epoch_val_total += 1
-                        
-                        # Average by number of templates
-                        total_val_loss += batch_val_loss / len(valid_templates)
+                            vocab_size = logits.size(-1)
+                            shift_logits = logits[:, :-1, :].contiguous()
+                            shift_labels = labels[:, 1:].contiguous()
+
+                            ce = F.cross_entropy(
+                                shift_logits.view(-1, vocab_size), shift_labels.view(-1),
+                                ignore_index=-100, reduction='none').view(N, -1)
+                            valid_tokens = (shift_labels != -100).float()
+                            per_seq_loss = (ce * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1)
+
+                            acc_positions = pad_lens + torch.tensor(all_prompt_lens, device=device) - 1
+                            label_positions = pad_lens + torch.tensor(all_prompt_lens, device=device)
+                            next_token_logits = logits[torch.arange(N, device=device), acc_positions]
+                            true_ids = labels[torch.arange(N, device=device), label_positions]
+                            epoch_val_correct += (next_token_logits.argmax(dim=-1) == true_ids).sum().item()
+                            epoch_val_total += N
+
+                            offset = 0
+                            for sample_idx in range(B):
+                                nt = all_n_templates[sample_idx]
+                                total_val_loss += per_seq_loss[offset:offset + nt].sum() / nt
+                                offset += nt
+
+                        else:
+                            # Sequential (original behavior)
+                            for sample_idx in range(B):
+                                vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
+                                layer_vectors = all_layer_vectors[sample_idx]
+
+                                batch_val_loss = 0.0
+                                valid_templates = [t for t in templates if t is not None]
+                                if not valid_templates:
+                                    valid_templates = [None]
+
+                                for template in valid_templates:
+                                    inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
+                                    combined_text = inference_query_text + target_text
+
+                                    llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
+                                    input_ids = llama_inputs.input_ids
+                                    prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
+                                    prompt_len = prompt_ids.shape[1]
+
+                                    labels = input_ids.clone()
+                                    labels[:, :prompt_len] = -100
+                                    llama_inputs["labels"] = labels
+
+                                    edit_layers = list(range(self.model_config["n_layers"]))
+                                    intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
+
+                                    with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
+                                        outputs = llama_model(**llama_inputs)
+
+                                    batch_val_loss += outputs.loss
+
+                                    logits = outputs.logits
+                                    next_token_logits = logits[:, prompt_len-1, :]
+                                    preds = next_token_logits.argmax(dim=-1)
+                                    true_id = llama_inputs["labels"][:, prompt_len]
+                                    epoch_val_correct += (preds == true_id).sum().item()
+                                    epoch_val_total += 1
+
+                                total_val_loss += batch_val_loss / len(valid_templates)
 
                     avg_val_loss = total_val_loss / len(val_data)
                     val_loss_lst.append(avg_val_loss)
@@ -1281,7 +1423,7 @@ class Retrieve_Evaluator:
                     avg_val_token_acc = epoch_val_correct / epoch_val_total
 
                     print(f"Epoch {epoch + 1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}, Validation Token Acc: {avg_val_token_acc:.4f}")
-                        
+
                     checkpoint = {
                         'epoch': epoch,
                         'gpt2_model_state_dict': gpt2_model.state_dict(),
@@ -1290,13 +1432,13 @@ class Retrieve_Evaluator:
                         'train_loss': avg_train_loss,
                         'val_loss': avg_val_loss,
                     }
-                    
+
                     if self.args.save_model or epoch + 1 == 10:
                         os.makedirs(self.args.save_dir, exist_ok=True)
                         torch.save(checkpoint, os.path.join(self.args.save_dir, f'best_model_epoch_{epoch+1}.pt'))
                         print(f"Saved model at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
 
-        os.makedirs(self.args.save_dir, exist_ok=True)  
+        os.makedirs(self.args.save_dir, exist_ok=True)
         torch.save(checkpoint, os.path.join(self.args.save_dir, f'best_model_epoch.pt'))
         print(f"Saved model at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
 
@@ -1355,6 +1497,8 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--save_model", action='store_true', required=False)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for GPT-2 and sample grouping")
+    parser.add_argument("--llama_batch", action='store_true', help="Batch LLaMA forward (batch_size * n_templates at once). Faster but fp16 numerical diff")
 
     args = parser.parse_args()
     seed_everything(seed=args.seed)

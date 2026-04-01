@@ -487,32 +487,85 @@ class Retrieve_Evaluator:
         return results
 
     def retrieve_and_intervene_all_layers(self, dataset_split, template=None, nshots=None):
-        # Implementation for all layers intervention
+        # Implementation for all layers intervention with batching
         results = self.init_results(dataset_split, nshots, True)
-        
-        for i in tqdm(range(len(self.dataset[dataset_split]))):
-            word_pairs_test = self.dataset[dataset_split][i]
-            query_text, target = self.prepare_query_text(word_pairs_test, template)
-         
-            
-            inputs, target_token_id = self.prepare_model_inputs(query_text, target)
-            results['token_lengths'].append(len(inputs.input_ids.squeeze()) - 1)
-            clean_output, clean_time = self.perform_clean_inference(inputs)
-            results["clean_time_list"].append(clean_time)
-            clean_acc = int((torch.argsort(clean_output.squeeze(), descending=True)[0] == target_token_id[0]).item())
-            results['clean_acc_list'].append(clean_acc)
+        batch_size = self.args.batch_size
+        dataset_len = len(self.dataset[dataset_split])
 
-            query_activation = calculate_natural_text_activations(query_text, self.model, self.tokenizer, self.model_config)
+        for batch_start in tqdm(range(0, dataset_len, batch_size)):
+            batch_end = min(batch_start + batch_size, dataset_len)
+            B = batch_end - batch_start
 
-            # disable, task_vector, _, task_label = self.retrieve(query_text, query_activation, retrieve_layer=None)
-            disable, task_vector, _, task_label = self.adaptive_retrieval(query_text)
+            # Prepare all texts in the batch
+            batch_query_texts = []
+            batch_targets = []
+            batch_target_token_ids = []
+            batch_word_pairs = []
+            for i in range(batch_start, batch_end):
+                word_pairs_test = self.dataset[dataset_split][i]
+                query_text, target = self.prepare_query_text(word_pairs_test, template)
+                target_token_id = get_answer_id(query_text, target, self.tokenizer)
+                batch_query_texts.append(query_text)
+                batch_targets.append(target)
+                batch_target_token_ids.append(target_token_id)
+                batch_word_pairs.append(word_pairs_test)
 
+            # 1. Batched clean inference
+            clean_inputs = self.tokenizer(batch_query_texts, return_tensors="pt", padding=True).to(self.model.device)
+            for i in range(B):
+                seq_len = clean_inputs.attention_mask[i].sum().item()
+                results['token_lengths'].append(seq_len - 1)
+
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            start_time.record()
+            clean_logits = self.model(**clean_inputs).logits  # [B, seq, vocab]
+            end_time.record()
+            torch.cuda.synchronize()
+            clean_time = start_time.elapsed_time(end_time) / 1000
+
+            # Extract last-token logits (left-padded, so -1 is the last real token)
+            clean_outputs = clean_logits[:, -1, :]  # [B, vocab]
+
+            for i in range(B):
+                clean_acc = int((torch.argsort(clean_outputs[i], descending=True)[0] == batch_target_token_ids[i][0]).item())
+                results['clean_acc_list'].append(clean_acc)
+                results["clean_time_list"].append(clean_time / B)
+
+            # 2. Batched GPT-2 adaptive retrieval
+            gpt2_inputs = self.gpt_2_tokenizer(batch_query_texts, return_tensors="pt", padding=True).to(self.model.device)
+            gpt2_outputs = self.gpt2_model(**gpt2_inputs)
+            gpt2_lengths = gpt2_inputs.attention_mask.sum(dim=1) - 1
+            gpt2_last_tokens = gpt2_outputs.last_hidden_state[torch.arange(B), gpt2_lengths]  # [B, 768]
+
+            projected = self.projection_layer(gpt2_last_tokens)  # [B, n_layers*hidden]
+            all_layer_vectors = projected.view(B, self.model_config["n_layers"], self.model_config["hidden_dim"])  # [B, 32, 4096]
+
+            # 3. Batched intervened inference
             edit_layers = list(range(self.model_config["n_layers"]))
-            self.perform_intervene(disable, edit_layers, inputs, target_token_id, task_vector, task_label, clean_acc, clean_time, results, query_text, clean_output, target, template)
-           
-            
-            # if dataset_split == "test" and nshots:
-            #     self.perform_nshot_inference(word_pairs_test, nshots, results, template)
+            intervention_fn = add_function_vector(edit_layers, all_layer_vectors, device=self.model.device, idx=-1,
+                                                   weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False)
+
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            start_time.record()
+            with TraceDict(self.model, layers=self.model_config["layer_hook_names"], edit_output=intervention_fn):
+                intervene_logits = self.model(**clean_inputs).logits  # [B, seq, vocab]
+            end_time.record()
+            torch.cuda.synchronize()
+            intervene_time = start_time.elapsed_time(end_time) / 1000
+
+            intervene_outputs = intervene_logits[:, -1, :]  # [B, vocab]
+
+            # 4. Record per-sample results
+            for i in range(B):
+                intervene_acc = int((torch.argsort(intervene_outputs[i], descending=True)[0] == batch_target_token_ids[i][0]).item())
+                results['intervene_results'].append(intervene_acc)
+                results['intervene_time_list'].append(intervene_time / B)
+                results['retrieve_acc'].append(1)
+                results["chosen_state_num"].append(1)
+                self.record_output(results, batch_query_texts[i], clean_outputs[i:i+1], intervene_outputs[i:i+1],
+                                   self.args.dataset_name, batch_targets[i], edit_layers)
 
         return results
 
@@ -1017,23 +1070,27 @@ class Retrieve_Evaluator:
         print("Loading trained GPT-2 model and projection layer...")
         # Load GPT-2 model and tokenizer
         gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
         gpt2_model = GPT2Model.from_pretrained("gpt2").to(self.args.device)
-        
+
         # Initialize projection layer
         gpt2_hidden_size = gpt2_model.config.hidden_size
         llama_hidden_size = self.model_config["hidden_dim"]
         llama_num_layers = self.model_config["n_layers"]
         projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers).to(self.args.device)
-        
+
         # Load trained weights
         checkpoint = torch.load(self.args.trained_model_path)
         gpt2_model.load_state_dict(checkpoint['gpt2_model_state_dict'])
         projection_layer.load_state_dict(checkpoint['projection_layer_state_dict'])
-        
+
         # Set models to eval mode
         gpt2_model.eval()
         projection_layer.eval()
-        
+
+        # Set left-padding for batched inference
+        self.tokenizer.padding_side = "left"
+
         return gpt2_tokenizer, gpt2_model, projection_layer
 
 ###################################################
@@ -1083,6 +1140,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_layers", type=int, default=None)
 
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference (1 = original behavior)")
     args = parser.parse_args()
     seed_everything(seed=args.seed)
     output_file = f"{args.save_dir}/{args.model_name.split('/')[-1]}_{args.dataset_name}_{args.retrieve_method}_{args.shots}shots_{args.weight_ori}ori_{args.weight_fv}fv_{args.recall}recall.json"
