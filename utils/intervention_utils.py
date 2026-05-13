@@ -14,7 +14,7 @@ def get_module(model, name):
 def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 2", bins=100, save_name=None):
     """
     Plot the distributions of two [1, 4096] tensors side by side.
-    
+
     :param tensor1: First tensor to plot
     :param tensor2: Second tensor to plot
     :param name1: Name of the first tensor (for legend)
@@ -24,11 +24,11 @@ def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 
     # Convert tensors to numpy arrays
     array1 = tensor1.cpu().numpy().flatten()
     array2 = tensor2.cpu().numpy().flatten()
-    
+
     # Create the plot
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
     fig.suptitle('Distribution Comparison of Two Tensors')
-    
+
     # Plot histograms
     ax1.hist(array1, bins=bins, alpha=0.7, label=name1)
     ax1.hist(array2, bins=bins, alpha=0.7, label=name2)
@@ -36,7 +36,7 @@ def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 
     ax1.set_xlabel('Values')
     ax1.set_ylabel('Frequency')
     ax1.legend()
-    
+
     # Plot kernel density estimation
     from scipy.stats import gaussian_kde
     kde1 = gaussian_kde(array1)
@@ -48,12 +48,12 @@ def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 
     ax2.set_xlabel('Values')
     ax2.set_ylabel('Density')
     ax2.legend()
-    
+
     # Add some statistics
     stats_text = f'{name1} - Mean: {array1.mean():.4f}, Std: {array1.std():.4f}\n'
     stats_text += f'{name2} - Mean: {array2.mean():.4f}, Std: {array2.std():.4f}'
     fig.text(0.5, 0.01, stats_text, ha='center', va='bottom', fontsize=10)
-    
+
     plt.tight_layout()
     plt.show()
     plt.savefig(f"results/new_vs_original/{save_name}.png")
@@ -135,7 +135,7 @@ def function_vector_intervention(sentence, target, edit_layer, function_vector, 
     device = model.device
     inputs = tokenizer(sentence, return_tensors="pt").to(device)
     original_pred_idx = len(inputs.input_ids.squeeze()) - 1
-    
+
     if compute_nll:
         target_completion = "".join(sentence+target)
         nll_inputs = tokenizer(target_completion, return_tensors="pt").to(device)
@@ -159,13 +159,13 @@ def function_vector_intervention(sentence, target, edit_layer, function_vector, 
     else:
         clean_output = model(**inputs).logits[:,-1,:]
         intervention_idx = -1
-    
+
     # perform Intervention
     intervention_fn = add_function_vector(edit_layer, function_vector, device=model.device, idx=intervention_idx, plot=plot, weight_fv=weight_fv, weight_ori=weight_ori, norm=norm) #function_vector.reshape(1, model_config['hidden_dim'])
-    
-    
+
+
     if compute_nll:
-        with TraceDict(model, layers=model_config["layer_hook_names"], edit_output=intervention_fn):
+        with TraceDict(model, layers=model_config["layer_hook_names"], edit_output=intervention_fn, retain_output=False):
             output = model(**nll_inputs, labels=nll_targets)
             intervention_nll = output.loss.item()
             intervention_output = output.logits[:, original_pred_idx,:]
@@ -178,7 +178,7 @@ def function_vector_intervention(sentence, target, edit_layer, function_vector, 
             # # output = model.generate(inputs.input_ids, top_p=0.9, temperature=0.1, max_new_tokens=MAX_NEW_TOKENS)
             # intervention_output = tokenizer.decode(output.squeeze()[-MAX_NEW_TOKENS:])
         start_time = time.time()
-        with TraceDict(model, layers=model_config['layer_hook_names'], edit_output=intervention_fn):     
+        with TraceDict(model, layers=model_config['layer_hook_names'], edit_output=intervention_fn, retain_output=False):
             intervention_output = model.generate(**inputs, max_new_tokens = 1,  do_sample=False, top_p=1.0, num_beams=1, temperature=1.0, repetition_penalty=1.0, pad_token_id=tokenizer.eos_token_id)
         intervention_output = model.generate(intervention_output, max_new_tokens=MAX_NEW_TOKENS-1, do_sample=False, top_p=1.0, num_beams=1, temperature=1.0, repetition_penalty=1.0, pad_token_id=tokenizer.eos_token_id)
         end_time = time.time()
@@ -186,7 +186,7 @@ def function_vector_intervention(sentence, target, edit_layer, function_vector, 
         intervention_output = tokenizer.decode(intervention_output.squeeze()[inputs.input_ids.shape[1]:])
 
     else:
-        with TraceDict(model, layers=model_config["layer_hook_names"], edit_output=intervention_fn):
+        with TraceDict(model, layers=model_config["layer_hook_names"], edit_output=intervention_fn, retain_output=False):
             start_time = time.time()
             intervention_output = model(**inputs).logits[:,-1,:]
             end_time = time.time()

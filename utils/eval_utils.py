@@ -377,7 +377,7 @@ def ce_loss(model_config, model, tokenizer, device, edit_layer=None, function_ve
 
             input_ids = owt[i]['input_ids'][:, :128].to(device)
             if function_vector is not None:
-                with TraceDict(model,  layers=model_config["layer_hook_names"], edit_output=intervention_fn) as ret:
+                with TraceDict(model,  layers=model_config["layer_hook_names"], edit_output=intervention_fn, retain_output=False) as ret:
                     loss = model(input_ids, labels=input_ids).loss
             else:
                 loss = model(input_ids, labels=input_ids).loss

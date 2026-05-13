@@ -27,6 +27,8 @@ Running the above script trains the model on all 20 in-domain datasets. After tr
 #### Batch options (Training)
 - `--batch_size N`: Groups N samples for GPT-2 forward.
 - `--llama_batch`: Additionally batches LLaMA forward (N samples × 3 templates at once). FP16 numerical differences cause slightly different training trajectories.
+- `--logits_to_keep`: Computes only final-token logits on compatible last-token inference paths. Adaptive training loss keeps full logits to preserve the original teacher-forcing objective.
+- `--gradient_checkpointing`: Enables LLaMA activation checkpointing during training. This substantially reduces memory by recomputing LLaMA activations during backward, with extra compute cost.
 
 ```bash
 # GPT-2 batch only
@@ -34,6 +36,9 @@ python ATV_training.py ... --batch_size 2
 
 # GPT-2 + LLaMA batch
 python ATV_training.py ... --batch_size 2 --llama_batch
+
+# Memory-focused mode
+python ATV_training.py ... --batch_size 2 --llama_batch --gradient_checkpointing
 ```
 
 ### Evaluate all datasets
@@ -44,6 +49,7 @@ Running the above script enables evaluation of performance on each individual da
 
 #### Batch options (Evaluation)
 - `--batch_size N`: Batches N samples for GPT-2 and LLaMA forward simultaneously.
+- `--logits_to_keep`: Computes only the final-token logits for last-token evaluation. This saves memory but can introduce tiny numerical differences.
 
 ```bash
 python ATV_evaluate.py ... --batch_size 4
