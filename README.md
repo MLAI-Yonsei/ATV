@@ -20,11 +20,6 @@ Code repositories for __ATV (Adaptive Task Vectors).__
 | Paper ATV | 77.6 ± 2.7 | 80.8 ± 2.6 | 26.4 ± 2.7 | 80.6 ± 2.3 | 51.7 ± 3.1 | 63.4 ± 2.5 |
 | i-mix + Category subtraction | 82.7 ± 9.7 | 84.0 ± 0.7 | 31.0 ± 2.5 | 83.1 ± 2.3 | 52.0 ± 2.8 | 66.6 ± 2.7 |
 
-## Updates from `dcfeb30`
-
-This version keeps the `dcfeb30b4b7bd800034ed982e208b61a844d8f17` code path and adds the experiment-backed i-mix training objective plus JSON-selected mean category subtraction.
-The category subtraction JSON selects the source datasets, coefficient, and layer mask for each dataset.
-
 ## Requirements
 
 To run this code, create and activate a conda environment using the provided `environment.yaml` file:
