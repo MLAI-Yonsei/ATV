@@ -34,6 +34,87 @@ import copy
 
 MAX_NEW_TOKENS = 256
 
+
+def soft_supcon_loss(features, soft_labels, temperature=0.1):
+    """SupCon with soft positive weights (for label-mixed samples).
+
+    Args:
+        features    : [N, D] float
+        soft_labels : [N, C] float (rows sum to 1; e.g., mix of one-hots)
+        temperature : τ
+
+    Positive weight between i,j is soft_labels[i] · soft_labels[j]. Diagonal masked.
+    """
+    device = features.device
+    N = features.shape[0]
+    if N < 2:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+    z = torch.nn.functional.normalize(features.float(), dim=-1)
+    sim = z @ z.T / temperature                                 # [N, N]
+    self_mask = torch.eye(N, dtype=torch.bool, device=device)
+    not_self = (~self_mask).float()
+    sim_for_max = sim.masked_fill(self_mask, float("-inf"))
+    sim_max = sim_for_max.detach().max(dim=1, keepdim=True).values
+    sim_stable = sim - sim_max
+    exp_sim = sim_stable.exp() * not_self
+    denom = exp_sim.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    log_prob = sim_stable - denom.log()                         # [N, N]
+
+    pos_w = (soft_labels.float() @ soft_labels.float().T) * not_self  # [N, N]
+    w_sum = pos_w.sum(dim=1).clamp_min(1e-8)                          # [N]
+    valid = pos_w.sum(dim=1) > 1e-8
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+    pos_log_prob = (log_prob * pos_w).sum(dim=1) / w_sum              # [N]
+    return -pos_log_prob[valid].mean()
+
+
+def supcon_loss(features, labels, temperature=0.1):
+    """Supervised Contrastive Loss (Khosla et al. 2020).
+
+    Args:
+        features : [N, D] float tensor (will be L2-normalized).
+        labels   : [N] int tensor of class IDs.
+        temperature: τ.
+
+    Returns 0-dim loss tensor. Returns 0 if no positive pairs exist
+    (e.g., all labels distinct or batch too small).
+    """
+    device = features.device
+    N = features.shape[0]
+    if N < 2:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+
+    z = torch.nn.functional.normalize(features.float(), dim=-1)
+    sim = z @ z.T / temperature                                           # [N, N]
+
+    self_mask = torch.eye(N, dtype=torch.bool, device=device)
+    not_self = (~self_mask).float()                                       # [N, N]
+
+    # Numerical stability: subtract per-row max from finite (non-self) entries.
+    sim_for_max = sim.masked_fill(self_mask, float("-inf"))
+    sim_max = sim_for_max.detach().max(dim=1, keepdim=True).values        # [N, 1]
+    sim_stable = sim - sim_max
+
+    # exp, with diagonal zeroed out. Never produce -inf.
+    exp_sim = sim_stable.exp() * not_self                                  # [N, N]
+    denom = exp_sim.sum(dim=1, keepdim=True).clamp_min(1e-12)              # [N, 1]
+    log_prob = sim_stable - denom.log()                                    # [N, N]
+    # log_prob diagonal is finite garbage (we never use it via pos_mask=0).
+
+    labels = labels.view(-1)
+    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
+    n_pos_per_anchor = pos_mask.sum(dim=1)
+
+    valid = n_pos_per_anchor > 0
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+
+    pos_log_prob = (log_prob * pos_mask.float()).sum(dim=1)
+    loss_per_anchor = -pos_log_prob[valid] / n_pos_per_anchor[valid].float()
+    return loss_per_anchor.mean()
+
+
 def test_answer(pred_str, ans, natural_prompt):
     try:
         template = natural_prompt.split(" {input}")[0]
@@ -288,7 +369,11 @@ class Retrieve_Evaluator:
             safety_tasks = ["crows_pairs", "bbq_age", "ethics_justice", "ethics_commonsense"]
             language_tasks = ["superglue_rte", "superglue_wic", "glue_qnli", "glue_sst2", "glue_mnli"]
 
-            dataset_list = knowledge_tasks + reasoning_tasks + mathematic_tasks + safety_tasks + language_tasks
+            if getattr(self.args, 'train_datasets', None):
+                dataset_list = [d.strip() for d in self.args.train_datasets.split(',') if d.strip()]
+                print(f"Override dataset_list -> {dataset_list}")
+            else:
+                dataset_list = knowledge_tasks + reasoning_tasks + mathematic_tasks + safety_tasks + language_tasks
 
             all_datasets = {}
             
@@ -1109,16 +1194,74 @@ class Retrieve_Evaluator:
         llama_model.eval()
         for param in llama_model.parameters():
             param.requires_grad = False
-        gpt2_hidden_size = gpt2_model.config.hidden_size    
-        llama_hidden_size = llama_model.config.hidden_size    
+        gpt2_hidden_size = gpt2_model.config.hidden_size
+        llama_hidden_size = llama_model.config.hidden_size
         llama_num_layers = llama_model.config.num_hidden_layers
-        projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers).to(device)
+        proj_bias = not getattr(self.args, "bias_free_projection", False)
+        projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers, bias=proj_bias).to(device)
         projection_layer.train()
+        if not proj_bias:
+            print("Projection layer initialized with bias=False")
         optimizer = optim.Adam(
-            list(gpt2_model.parameters()) + list(projection_layer.parameters()), 
+            list(gpt2_model.parameters()) + list(projection_layer.parameters()),
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay
         )
+
+        # ---- Contrastive setup ----
+        use_contrast = getattr(self.args, "use_contrastive", False)
+        contrast_lambda = float(getattr(self.args, "contrastive_lambda", 0.0))
+        contrast_lambda_end = getattr(self.args, "contrastive_lambda_end", None)
+        contrast_temperature = float(getattr(self.args, "contrastive_temperature", 0.1))
+        contrast_batch_size = int(getattr(self.args, "contrastive_batch_size", 32))
+        use_simcse = bool(getattr(self.args, "use_simcse", False))
+        use_imix = bool(getattr(self.args, "use_imix", False))
+        imix_alpha = float(getattr(self.args, "imix_alpha", 0.2))
+        hierarchical_beta = float(getattr(self.args, "hierarchical_beta", 0.5))
+        if use_contrast:
+            level = getattr(self.args, "contrastive_level", "dataset")
+            # 5-category mapping (matches ATV_analysis.py)
+            CATEGORY_MAP = {
+                "superglue_rte": "nlu", "superglue_wic": "nlu", "glue_qnli": "nlu",
+                "glue_sst2": "nlu", "glue_mnli": "nlu",
+                "arc_challenge": "reasoning", "bbh_boolean_expressions": "reasoning",
+                "bbh_date_understanding": "reasoning",
+                "bbh_reasoning_about_colored_objects": "reasoning",
+                "bbh_temporal_sequences": "reasoning",
+                "boolq": "knowledge", "commonsense_qa": "knowledge",
+                "hellaswag": "knowledge", "openbookqa": "knowledge",
+                "math_qa": "math", "mmlu_pro_math": "math",
+                "crows_pairs": "safety", "bbq_age": "safety",
+                "ethics_justice": "safety", "ethics_commonsense": "safety",
+            }
+            if level == "category":
+                def label_for(ds_name):
+                    return CATEGORY_MAP.get(ds_name, ds_name)
+            else:
+                def label_for(ds_name):
+                    return ds_name
+
+            unique_names = sorted({label_for(sample[2].get("dataset_name", self.args.dataset_name))
+                                   for sample in train_data})
+            name_to_id = {n: i for i, n in enumerate(unique_names)}
+
+            # For hierarchical, also build category id mapping (independent of dataset id)
+            cat_to_id = {}
+            if level == "hierarchical":
+                unique_cats = sorted({CATEGORY_MAP.get(sample[2].get("dataset_name", self.args.dataset_name),
+                                                       sample[2].get("dataset_name", self.args.dataset_name))
+                                      for sample in train_data})
+                cat_to_id = {c: i for i, c in enumerate(unique_cats)}
+
+            anneal_str = f" → {contrast_lambda_end}" if contrast_lambda_end is not None else ""
+            simcse_str = " +SimCSE" if use_simcse else ""
+            imix_str = f" +iMix(α={imix_alpha})" if use_imix else ""
+            hier_str = f" +HierBeta={hierarchical_beta} ({len(cat_to_id)} cats)" if level == "hierarchical" else ""
+            print(f"Contrastive ON: level={level}  λ={contrast_lambda}{anneal_str}  τ={contrast_temperature}  batch={contrast_batch_size}{simcse_str}{imix_str}{hier_str}  classes={len(unique_names)} ({unique_names})")
+        else:
+            name_to_id = {}
+            def label_for(ds_name):
+                return ds_name
         
         ####################################
         # Training & Validation Loop
@@ -1132,82 +1275,183 @@ class Retrieve_Evaluator:
         val_loss_lst = []
         start_time = time.time()
 
+        import random as _random
+        rng = _random.Random(self.args.seed)
+
         for epoch in range(num_epochs):
             epoch_train_correct = 0
             epoch_train_total = 0
 
+            # Linearly anneal λ if --contrastive_lambda_end given
+            if contrast_lambda_end is not None and num_epochs > 1:
+                t = epoch / (num_epochs - 1)
+                lambda_now = (1 - t) * contrast_lambda + t * contrast_lambda_end
+            else:
+                lambda_now = contrast_lambda
+
             # Training
-            total_loss = 0.0
+            total_ce_loss = 0.0
+            total_contrast_loss = 0.0
+            n_steps = 0
             gpt2_model.train()
             projection_layer.train()
 
+            # Shuffle each epoch so contrastive batches contain multiple datasets
+            order = list(range(len(train_data)))
+            rng.shuffle(order)
+
+            # Per-batch buffers for SupCon: re-run GPT-2 (with grad) only at batch boundary
+            # to avoid keeping 32 Llama forward graphs simultaneously.
+            samples_in_batch = []   # list of (input_text, dataset_id) for SupCon re-forward
+            sample_count = 0
+
+            optimizer.zero_grad()
+
             with torch.enable_grad():
-                for vector_input_text, target_text, word_pairs_test, templates in train_data:
-                    optimizer.zero_grad()
-                    
-                    # 1. Vector generation
+                for sidx, _i in enumerate(order):
+                    vector_input_text, target_text, word_pairs_test, templates = train_data[_i]
+
+                    # 1. GPT-2 forward (graph will be freed when CE backward runs)
                     gpt2_inputs = gpt2_tokenizer(vector_input_text, return_tensors="pt").to(device)
                     gpt2_outputs = gpt2_model(**gpt2_inputs)
                     gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-                    
+
                     # 2. Vector expansion
                     projected_vector = projection_layer(gpt2_last_token)
                     layer_vectors = projected_vector.view(llama_num_layers, llama_hidden_size)
-                    
-                    # Calculate loss with various templates
-                    batch_loss = 0.0
+
+                    # 3. CE loss across templates, summed then averaged.
                     valid_templates = [t for t in templates if t is not None]
-                    
-                    # Use default template if no valid templates exist
                     if not valid_templates:
-                        valid_templates = [None]  # Use default format
-                        
+                        valid_templates = [None]
+
+                    batch_loss = 0.0
                     for template in valid_templates:
-                        # Create input for each template
                         inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
                         combined_text = inference_query_text + target_text
-                        
-                        # Tokenize and set labels
+
                         llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
                         input_ids = llama_inputs.input_ids
                         prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
                         prompt_len = prompt_ids.shape[1]
-                        
+
                         labels = input_ids.clone()
                         labels[:, :prompt_len] = -100
                         llama_inputs["labels"] = labels
 
-                        # Apply intervention
                         edit_layers = list(range(self.model_config["n_layers"]))
                         intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
 
                         with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
                             outputs = llama_model(**llama_inputs)
-                        
-                        # Accumulate loss for each template
-                        batch_loss += outputs.loss
+
+                        batch_loss = batch_loss + outputs.loss
 
                         logits = outputs.logits
-                        next_token_logits = logits[:, prompt_len-1, :]   # [1, V]
+                        next_token_logits = logits[:, prompt_len-1, :]
                         preds = next_token_logits.argmax(dim=-1)
-                        
                         true_id = llama_inputs["labels"][:, prompt_len]
-                        correct = (preds == true_id).sum().item()
-                        epoch_train_correct += correct
+                        epoch_train_correct += (preds == true_id).sum().item()
                         epoch_train_total += 1
 
-                    # Average by number of templates
-                    loss = batch_loss / len(valid_templates)
-                    loss.backward()
-                    optimizer.step()
-                    total_loss += loss.item()
+                    sample_ce = batch_loss / len(valid_templates)
+                    # Backward CE per sample (scaled so grads accumulate to mean over batch).
+                    # This frees the Llama+projection+gpt2 graph for this sample.
+                    (sample_ce / contrast_batch_size).backward()
+                    total_ce_loss += float(sample_ce.item())
 
-                avg_train_loss = total_loss / len(train_data)
+                    if use_contrast:
+                        ds_name = word_pairs_test.get("dataset_name", self.args.dataset_name)
+                        ds_id = name_to_id[label_for(ds_name)]
+                        cat_id = cat_to_id.get(CATEGORY_MAP.get(ds_name, ds_name), -1) if level == "hierarchical" else -1
+                        samples_in_batch.append((vector_input_text, ds_id, cat_id))
+                    sample_count += 1
+
+                    is_last = (sidx == len(order) - 1)
+                    if sample_count >= contrast_batch_size or is_last:
+                        if use_contrast and len(samples_in_batch) >= 2:
+                            ds_ids = [s[1] for s in samples_in_batch]
+                            cat_ids = [s[2] for s in samples_in_batch]
+                            has_positive = use_simcse or use_imix or (len(set(ds_ids)) < len(ds_ids)) or \
+                                           (level == "hierarchical" and len(set(cat_ids)) < len(cat_ids))
+                            con_term = None
+                            if has_positive:
+                                if use_imix:
+                                    embeds = []
+                                    for s in samples_in_batch:
+                                        gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
+                                        go = gpt2_model(**gi)
+                                        embeds.append(go.last_hidden_state[:, -1, :])
+                                    feats_orig = torch.cat(embeds, dim=0)
+                                    B = feats_orig.shape[0]
+                                    perm = torch.randperm(B, device=device)
+                                    alpha_ = torch.distributions.Beta(imix_alpha, imix_alpha).sample([B, 1]).to(device)
+                                    feats = alpha_ * feats_orig + (1 - alpha_) * feats_orig[perm]
+                                    n_ds = len(unique_names)
+                                    y_oh_ds = torch.nn.functional.one_hot(
+                                        torch.tensor(ds_ids, device=device), n_ds
+                                    ).float()
+                                    y_mix_ds = alpha_ * y_oh_ds + (1 - alpha_) * y_oh_ds[perm]
+                                    if level == "hierarchical":
+                                        n_cat = len(cat_to_id)
+                                        y_oh_cat = torch.nn.functional.one_hot(
+                                            torch.tensor(cat_ids, device=device), n_cat
+                                        ).float()
+                                        y_mix_cat = alpha_ * y_oh_cat + (1 - alpha_) * y_oh_cat[perm]
+                                        con_ds = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
+                                        con_cat = soft_supcon_loss(feats, y_mix_cat, temperature=contrast_temperature)
+                                        con_term = con_ds + hierarchical_beta * con_cat
+                                    else:
+                                        con_term = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
+                                elif use_simcse:
+                                    embeds_a, embeds_b = [], []
+                                    for s in samples_in_batch:
+                                        gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
+                                        go_a = gpt2_model(**gi)
+                                        go_b = gpt2_model(**gi)
+                                        embeds_a.append(go_a.last_hidden_state[:, -1, :])
+                                        embeds_b.append(go_b.last_hidden_state[:, -1, :])
+                                    feats = torch.cat(embeds_a + embeds_b, dim=0)
+                                    lbls = torch.tensor(ds_ids + ds_ids, device=device)
+                                    con_term = supcon_loss(feats, lbls, temperature=contrast_temperature)
+                                else:
+                                    embeds = []
+                                    for s in samples_in_batch:
+                                        gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
+                                        go = gpt2_model(**gi)
+                                        embeds.append(go.last_hidden_state[:, -1, :])
+                                    feats = torch.cat(embeds, dim=0)
+                                    if level == "hierarchical":
+                                        ds_lbls = torch.tensor(ds_ids, device=device)
+                                        cat_lbls = torch.tensor(cat_ids, device=device)
+                                        con_ds = supcon_loss(feats, ds_lbls, temperature=contrast_temperature)
+                                        con_cat = supcon_loss(feats, cat_lbls, temperature=contrast_temperature)
+                                        con_term = con_ds + hierarchical_beta * con_cat
+                                    else:
+                                        lbls = torch.tensor(ds_ids, device=device)
+                                        con_term = supcon_loss(feats, lbls, temperature=contrast_temperature)
+                                if con_term is not None and con_term.requires_grad:
+                                    (lambda_now * con_term).backward()
+                                    total_contrast_loss += float(con_term.item())
+
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        n_steps += 1
+
+                        samples_in_batch.clear()
+                        sample_count = 0
+
+                avg_ce_loss = total_ce_loss / max(len(train_data), 1)
+                avg_contrast_loss = total_contrast_loss / max(n_steps, 1)
+                avg_train_loss = avg_ce_loss + lambda_now * avg_contrast_loss
                 train_loss_lst.append(avg_train_loss)
 
                 avg_train_token_acc = epoch_train_correct / epoch_train_total
 
-                print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Train Token Acc: {avg_train_token_acc:.4f}")
+                if use_contrast:
+                    print(f"Epoch {epoch + 1}/{num_epochs}, λ={lambda_now:.3f}, Train Loss: {avg_train_loss:.4f} (CE: {avg_ce_loss:.4f}, SupCon: {avg_contrast_loss:.4f}), Train Token Acc: {avg_train_token_acc:.4f}")
+                else:
+                    print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Train Token Acc: {avg_train_token_acc:.4f}")
 
                 # Validation
                 gpt2_model.eval()
@@ -1355,6 +1599,36 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--save_model", action='store_true', required=False)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--train_datasets", type=str, default=None,
+                        help="Comma-separated dataset list to train on. Overrides default 20-dataset mix.")
+    # Contrastive on GPT-2 hidden
+    parser.add_argument("--use_contrastive", action='store_true',
+                        help="Add SupCon loss on GPT-2 last_hidden_state with dataset label as class.")
+    parser.add_argument("--contrastive_lambda", type=float, default=1.0,
+                        help="Weight of SupCon loss.")
+    parser.add_argument("--contrastive_temperature", type=float, default=0.1,
+                        help="SupCon temperature τ.")
+    parser.add_argument("--contrastive_batch_size", type=int, default=32,
+                        help="Number of samples accumulated per optimizer step (must contain multiple datasets).")
+    parser.add_argument("--contrastive_level", type=str, default="dataset",
+                        choices=["dataset", "category", "hierarchical"],
+                        help="'dataset' (~20 classes), 'category' (5 task-categories), or 'hierarchical' (both, weighted by --hierarchical_beta).")
+    parser.add_argument("--hierarchical_beta", type=float, default=0.5,
+                        help="Weight of category-level SupCon when level=hierarchical. dataset-level uses weight 1.0.")
+    parser.add_argument("--use_proj_head", action='store_true',
+                        help="Add small MLP projection head (768→768→128) before SupCon. Discarded at inference.")
+    parser.add_argument("--proj_head_dim", type=int, default=128,
+                        help="Output dim of projection head when --use_proj_head.")
+    parser.add_argument("--contrastive_lambda_end", type=float, default=None,
+                        help="Final λ; linearly anneals from --contrastive_lambda to this over epochs. None = no anneal.")
+    parser.add_argument("--use_simcse", action='store_true',
+                        help="Augment SupCon with SimCSE-style self-positives via two dropout forwards per sample.")
+    parser.add_argument("--use_imix", action='store_true',
+                        help="Apply manifold mixup on GPT-2 hidden + soft SupCon (i-Mix style).")
+    parser.add_argument("--imix_alpha", type=float, default=0.2,
+                        help="Beta distribution parameter for mixing coefficient (Beta(α, α)). Smaller→more extreme mixes.")
+    parser.add_argument("--bias_free_projection", action='store_true',
+                        help="Use Linear(..., bias=False) for projection layer.")
 
     args = parser.parse_args()
     seed_everything(seed=args.seed)

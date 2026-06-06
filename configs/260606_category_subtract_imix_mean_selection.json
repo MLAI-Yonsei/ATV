@@ -1,0 +1,45 @@
+{
+  "description": "Dataset-specific i-mix ep15 plain mean category subtraction settings. This config intentionally excludes robust, residual, projection, subspace, adaptive, batch-eval, and last-token-only variants.",
+  "defaults": {
+    "variant": "mean",
+    "n": 90,
+    "split": "train",
+    "template_mode": "training3",
+    "batch_size": 32
+  },
+  "groups": {
+    "nlu": ["superglue_rte", "superglue_wic", "glue_qnli", "glue_sst2", "glue_mnli"],
+    "reasoning": ["arc_challenge", "bbh_boolean_expressions", "bbh_date_understanding", "bbh_reasoning_about_colored_objects", "bbh_temporal_sequences"],
+    "knowledge": ["boolq", "commonsense_qa", "hellaswag", "openbookqa"],
+    "math": ["math_qa", "mmlu_pro_math"],
+    "safety": ["bbq_age", "crows_pairs", "ethics_justice", "ethics_commonsense"],
+    "unseen": ["glue_cola", "bbq_religion", "deepmind", "mmlu_high_school_psychology", "bbh_logical_deduction_five_objects"]
+  },
+  "datasets": {
+    "arc_challenge": {"group": "knowledge", "beta": 0.3, "layers": "all"},
+    "bbh_boolean_expressions": {"group": "math", "beta": 0.2, "layers": "all"},
+    "bbh_date_understanding": {"group": "knowledge", "beta": 0.125, "layers": "all"},
+    "bbh_logical_deduction_five_objects": {"group": "nlu", "beta": 0.35, "layers": "all"},
+    "bbh_reasoning_about_colored_objects": {"group_name": "src_superglue_rte", "datasets": ["superglue_rte"], "beta": -0.13, "layers": "all"},
+    "bbh_temporal_sequences": {"group": "knowledge", "beta": 0.05, "layers": "all"},
+    "bbq_age": {"group": "math", "beta": 0.05, "layers": "all"},
+    "bbq_religion": {"group": "nlu", "beta": 0.05, "layers": "all"},
+    "boolq": {"group": "math", "beta": 0.25, "layers": "all"},
+    "commonsense_qa": {"group": "math", "beta": 0.35, "layers": "all"},
+    "crows_pairs": {"group": "safety", "beta": 0.3, "layers": "all"},
+    "deepmind": {"group_spec": "weighted_math=math_qa@0.55+mmlu_pro_math@0.45", "beta": 0.1125, "layers": "0,4,8,10,12,16,20,24,25"},
+    "ethics_commonsense": {"group": "math", "beta": 0.125, "layers": "all"},
+    "ethics_justice": {"group_name": "src_commonsense_qa", "datasets": ["commonsense_qa"], "beta": -0.25, "layers": "3-16"},
+    "glue_cola": {"group": "math", "beta": 0.05, "layers": "all"},
+    "glue_mnli": {"group_name": "src_glue_qnli", "datasets": ["glue_qnli"], "beta": -0.105, "layers": "4-25"},
+    "glue_qnli": {"group": "safety", "beta": 0.35, "layers": "all"},
+    "glue_sst2": {"group_name": "src_arc_challenge", "datasets": ["arc_challenge"], "beta": -1.0, "layers": "all"},
+    "hellaswag": {"group": "math", "beta": 0.3, "layers": "all"},
+    "math_qa": {"group": "safety", "beta": 0.35, "layers": "all"},
+    "mmlu_high_school_psychology": {"group_spec": "weighted_mmlu_mathqa=mmlu_pro_math@0.97+math_qa@0.03", "beta": 0.46205, "layers": "0-4,7-15,17-20,21"},
+    "mmlu_pro_math": {"group": "knowledge", "beta": 0.35, "layers": "all"},
+    "openbookqa": {"group": "math", "beta": 0.35, "layers": "all"},
+    "superglue_rte": {"group": "knowledge", "beta": 0.05, "layers": "all"},
+    "superglue_wic": {"group": "math", "beta": 0.05, "layers": "all"}
+  }
+}
