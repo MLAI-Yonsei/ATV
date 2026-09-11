@@ -1,16 +1,6 @@
 # ATV
 Code repositories for __ATV (Adaptive Task Vectors).__
 
-This branch implements Llama-3-8B ATV with the paper's GPT-2 Last-Mean readout.
-The last-token and masked-mean states are projected to 256 dimensions, combined
-with mean weight 0.7, and mapped to the target layers through a shared projection.
-No additional normalization or category subtraction is applied.
-
-The injection follows the paper: it modifies only the last prompt token at each
-target layer, which predicts the first answer token. Training and validation use
-`prompt_len - 1` in the prompt-plus-answer sequence. Inference uses the final
-prompt position, and subsequent generation proceeds without the hook.
-
 ## Requirements
 
 To run this code, create and activate a conda environment using the provided `environment.yaml` file:
@@ -32,12 +22,7 @@ conda activate ATV
    ```bash
    ./scripts/ATV_training.sh
    ```
-Running the above script trains the model on all 20 in-domain datasets using
-seeds 42, 100, and 10. It uses GPT-2 LoRA with rank 16, alpha 32, and dropout 0.05;
-AdamW with learning rates 8e-4 for LoRA and 1e-3 for the projections; and an
-effective batch size of 16 for 15 epochs. The objective combines answer-token CE
-with i-Mix on the last-token states using clean keys, temperature 0.1, mixup alpha
-0.5, and loss weight 1.0. The intervention weight is 0.001.
+Running the above script trains the model on all 20 in-domain datasets using seeds 42, 100, and 10.
 
 `best_model_epoch.pt` is selected by validation token accuracy, with validation
 loss breaking ties. Evaluation is run separately with the script below.
@@ -55,9 +40,7 @@ The defaults are `meta-llama/Meta-Llama-3-8B` and `gpt2`.
    ```bash
    ./scripts/ATV_evaluate.sh
    ```
-Running the above script evaluates the best validation checkpoint on all 25
-datasets. The readout configuration is loaded from the checkpoint, including
-mean weight 0.7.
+Running the above script evaluates the best validation checkpoint on all 25 datasets.
 
 ### Analyze results
    ```bash
