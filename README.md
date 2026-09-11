@@ -10,9 +10,6 @@ The injection follows the paper: it modifies only the last prompt token at each
 target layer, which predicts the first answer token. Training and validation use
 `prompt_len - 1` in the prompt-plus-answer sequence. Inference uses the final
 prompt position, and subsequent generation proceeds without the hook.
-This replaces the earlier sequence-wide broadcasting behavior. Existing
-checkpoint weights can be loaded, but their scores under this injection rule
-require reevaluation.
 
 ## Requirements
 
@@ -60,11 +57,7 @@ The defaults are `meta-llama/Meta-Llama-3-8B` and `gpt2`.
    ```
 Running the above script evaluates the best validation checkpoint on all 25
 datasets. The readout configuration is loaded from the checkpoint, including
-mean weight 0.7. Existing full GPT-2 checkpoints remain loadable.
-
-The dataset preparation and evaluation splits retain the existing repository
-behavior. Use the finalized evaluation data when comparing with the revised
-paper, which uses corrected GLUE evaluation sets.
+mean weight 0.7.
 
 ### Analyze results
    ```bash
