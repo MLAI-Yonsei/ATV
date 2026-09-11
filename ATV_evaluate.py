@@ -1,4 +1,5 @@
 import torch
+from utils.last_mean import CHECKPOINT_FORMAT, project_source, load_last_mean_checkpoint
 import torch.nn.functional as F
 import numpy as np
 from cuml.manifold import TSNE as cumlTSNE
@@ -1258,13 +1259,7 @@ class Retrieve_Evaluator:
             for batch_start in tqdm(range(0, len(prompts), batch_size), desc="category_subtract_mean"):
                 batch_prompts = prompts[batch_start:batch_start + batch_size]
                 inputs = self.gpt2_tokenize(batch_prompts)
-                outputs = self.gpt2_model(**inputs)
-                lengths = inputs.attention_mask.sum(dim=1) - 1
-                last_tokens = outputs.last_hidden_state[
-                    torch.arange(len(batch_prompts), device=self.model.device),
-                    lengths,
-                ]
-                projected = self.projection_layer(last_tokens)
+                projected = project_source(self.gpt2_model, inputs, self.projection_layer)
                 layer_vectors = projected.view(
                     len(batch_prompts),
                     self.model_config["n_layers"],
@@ -1306,10 +1301,7 @@ class Retrieve_Evaluator:
     
     def adaptive_retrieval(self, query_text):
         gpt2_inputs = self.gpt2_tokenize(query_text)
-        gpt2_outputs = self.gpt2_model(**gpt2_inputs)
-        gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-        
-        projected_vector = self.projection_layer(gpt2_last_token)
+        projected_vector = project_source(self.gpt2_model, gpt2_inputs, self.projection_layer)
         layer_vectors = projected_vector.view(self.model_config["n_layers"], self.model_config["hidden_dim"])
         layer_vectors = self.apply_category_subtraction(layer_vectors)
         
@@ -1322,10 +1314,18 @@ class Retrieve_Evaluator:
 
     def load_trained_models(self):
         print("Loading trained GPT-2 model and projection layer...")
+        checkpoint = torch.load(self.args.trained_model_path, map_location="cpu", weights_only=False)
+        if checkpoint.get("checkpoint_format") == CHECKPOINT_FORMAT:
+            tokenizer = GPT2Tokenizer.from_pretrained(self.args.gpt2_model_name)
+            tokenizer.pad_token = tokenizer.eos_token
+            model, projection = load_last_mean_checkpoint(
+                checkpoint, self.args.gpt2_model_name, self.args.device,
+                self.model_config["n_layers"], self.model_config["hidden_dim"])
+            return tokenizer, model, projection
         # Load GPT-2 model and tokenizer
-        gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        gpt2_tokenizer = GPT2Tokenizer.from_pretrained(self.args.gpt2_model_name)
         gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
-        gpt2_model = GPT2Model.from_pretrained("gpt2").to(self.args.device)
+        gpt2_model = GPT2Model.from_pretrained(self.args.gpt2_model_name).to(self.args.device)
         
         # Initialize projection layer
         gpt2_hidden_size = gpt2_model.config.hidden_size
@@ -1334,7 +1334,6 @@ class Retrieve_Evaluator:
         projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers).to(self.args.device)
         
         # Load trained weights
-        checkpoint = torch.load(self.args.trained_model_path)
         gpt2_model.load_state_dict(checkpoint['gpt2_model_state_dict'])
         projection_layer.load_state_dict(checkpoint['projection_layer_state_dict'])
         
@@ -1411,6 +1410,7 @@ if __name__ == "__main__":
                         help="GPT-2 projection batch size for category mean construction")
 
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--gpt2_model_name", default="gpt2")
     args = parser.parse_args()
     seed_everything(seed=args.seed)
     output_file = f"{args.save_dir}/{args.model_name.split('/')[-1]}_{args.dataset_name}_{args.retrieve_method}_{args.shots}shots_{args.weight_ori}ori_{args.weight_fv}fv_{args.recall}recall.json"

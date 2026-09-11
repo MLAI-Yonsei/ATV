@@ -61,7 +61,7 @@ def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 
 
 def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weight_fv=1.0, weight_ori=0, norm=False):
     """
-    Adds a vector to the output of a specified layer in the model
+    Adds a vector only at token position idx in the selected layers.
 
     Returns:
     add_act: a function specifying how to add a function vector to a layer's output hidden states
@@ -90,10 +90,10 @@ def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weigh
                     normalized_vector = updated_vector * (original_norm / updated_norm)
                     output[0][:, idx] = normalized_vector
                 else:
-                    # output[0][:, idx] = weight_ori * output[0][:, idx] + weight_fv * intert_fv.to(output[0].device) #
-
-                    current_vector_casted = intert_fv.to(output[0].dtype)
-                    new_hidden = output[0] + weight_fv * current_vector_casted.to(output[0].device)
+                    # Update only the token that predicts the first answer token.
+                    current_vector_casted = intert_fv.to(device=output[0].device, dtype=output[0].dtype)
+                    new_hidden = output[0].clone()
+                    new_hidden[:, idx] = weight_ori * output[0][:, idx] + weight_fv * current_vector_casted
                     return (new_hidden,) + output[1:]
 
                 return output
@@ -106,7 +106,10 @@ def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weigh
                     normalized_vector = updated_vector * (original_norm / updated_norm)
                     output[:, idx] = normalized_vector
                 else:
-                    output[:, idx] =  weight_ori * output[:, idx] + weight_fv * intert_fv .to(output.device) #intert_fv.to(output.device)
+                    current_vector_casted = intert_fv.to(device=output.device, dtype=output.dtype)
+                    new_hidden = output.clone()
+                    new_hidden[:, idx] = weight_ori * output[:, idx] + weight_fv * current_vector_casted
+                    return new_hidden
     
                 return output
         else:

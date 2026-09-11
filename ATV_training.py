@@ -1,4 +1,8 @@
 import torch
+from utils.last_mean import (LastMeanProjection, project_source, apply_gpt2_lora,
+    build_last_mean_optimizer, last_mean_config, build_last_mean_checkpoint,
+    atomic_torch_save, is_better_validation_candidate, accumulation_group_size,
+    backward_template_losses_memory_efficient, soft_cross_supcon_loss)
 import torch.nn.functional as F
 import numpy as np
 from cuml.manifold import TSNE as cumlTSNE
@@ -354,7 +358,8 @@ class Retrieve_Evaluator:
         
     def load_model(self):
         print("Loading Model and Tokenizer...")
-        return load_model_and_tokenizer(self.args.model_name, device=self.args.device)
+        return load_model_and_tokenizer(self.args.model_name, device=self.args.device,
+                                        force_single_gpu=self.args.last_mean)
     
     def load_dataset(self):
         if self.args.specific_data == None:
@@ -384,7 +389,7 @@ class Retrieve_Evaluator:
                                      test_split=self.args.test_split, seed=self.args.seed)
                 
                 # Process each split
-                for split in ["train", "valid", self.args.dataset_split]:
+                for split in (["train", "valid"] if self.args.train_only else ["train", "valid", self.args.dataset_split]):
                     if split in dataset and hasattr(dataset[split], "raw_data"):
                         # Add dataset name
                         dataset[split].raw_data['dataset_name'] = dataset_name
@@ -777,11 +782,11 @@ class Retrieve_Evaluator:
     
         return results
 
-    def create_intervention_function(self, edit_layer, tv):
+    def create_intervention_function(self, edit_layer, tv, idx=-1):
         if type(edit_layer) is list:
             # print("Edit Layer: ", edit_layer)
             # return add_function_vector(edit_layer, tv, device=self.model.device, idx=-1, weight_fv=args.weight_fv, weight_ori=args.weight_ori, norm=True), edit_layer
-            return add_function_vector(edit_layer, tv, device=self.model.device, idx=-1, weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False), edit_layer
+            return add_function_vector(edit_layer, tv, device=self.model.device, idx=idx, weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False), edit_layer
         else:
             if self.args.retrieve_method == "retriever" and self.args.n_layers is not None:
                 temp_tv = tv
@@ -794,7 +799,7 @@ class Retrieve_Evaluator:
                 factor = 1
                 norm = False
         print("Edit Layer: ", intervene_layers)
-        return add_function_vector(intervene_layers, temp_tv, device=self.model.device, idx=-1, 
+        return add_function_vector(intervene_layers, temp_tv, device=self.model.device, idx=idx,
                                    weight_fv=self.args.weight_fv / factor, weight_ori=self.args.weight_ori, norm=norm), intervene_layers
 
     def record_output(self, results, query_text, clean_output, intervention_output, task_label, target, intervene_layers):
@@ -1111,10 +1116,7 @@ class Retrieve_Evaluator:
     
     def adaptive_retrieval(self, query_text):
         gpt2_inputs = self.gpt_2_tokenizer(query_text, return_tensors="pt").to(self.model.device)
-        gpt2_outputs = self.gpt2_model(**gpt2_inputs)
-        gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-        
-        projected_vector = self.projection_layer(gpt2_last_token)
+        projected_vector = project_source(self.gpt2_model, gpt2_inputs, self.projection_layer)
         layer_vectors = projected_vector.view(self.model_config["n_layers"], self.model_config["hidden_dim"])
         
         icl_best_layer = None
@@ -1127,7 +1129,7 @@ class Retrieve_Evaluator:
     def adaptive_training(self):
         print("Loading ICV dataset...")
         
-        train_split, valid_split, test_split = self.dataset['train'], self.dataset['valid'], self.dataset['test']
+        train_split, valid_split, test_split = self.dataset['train'], self.dataset['valid'], self.dataset.get('test', [])
         
         # Simple template for vector generation
         vector_template = "Q: {input} \n A: "
@@ -1186,8 +1188,11 @@ class Retrieve_Evaluator:
 
         # Model initialization (same as before)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        gpt2_model = GPT2Model.from_pretrained("gpt2").to(device)
+        gpt2_tokenizer = GPT2Tokenizer.from_pretrained(self.args.gpt2_model_name)
+        gpt2_model = GPT2Model.from_pretrained(self.args.gpt2_model_name)
+        if self.args.last_mean:
+            gpt2_model = apply_gpt2_lora(gpt2_model, rank=16, alpha=32, dropout=0.05)
+        gpt2_model = gpt2_model.to(device)
         gpt2_model.train()
         llama_model = self.model
         llama_tokenizer = self.tokenizer
@@ -1198,15 +1203,31 @@ class Retrieve_Evaluator:
         llama_hidden_size = llama_model.config.hidden_size
         llama_num_layers = llama_model.config.num_hidden_layers
         proj_bias = not getattr(self.args, "bias_free_projection", False)
-        projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers, bias=proj_bias).to(device)
-        projection_layer.train()
-        if not proj_bias:
-            print("Projection layer initialized with bias=False")
-        optimizer = optim.Adam(
-            list(gpt2_model.parameters()) + list(projection_layer.parameters()),
-            lr=self.args.learning_rate,
-            weight_decay=self.args.weight_decay
-        )
+        if self.args.last_mean:
+            if not proj_bias:
+                raise ValueError("Last-Mean requires the trained projection bias configuration")
+            projection_layer = LastMeanProjection(
+                gpt2_hidden_size, llama_hidden_size * llama_num_layers,
+                mean_alpha=self.args.readout_mean_alpha,
+            ).to(device)
+            optimizer = build_last_mean_optimizer(
+                gpt2_model, projection_layer, self.args.gpt2_learning_rate,
+                self.args.learning_rate, self.args.weight_decay,
+            )
+            config = last_mean_config(self.args, gpt2_model, llama_model)
+            os.makedirs(self.args.save_dir, exist_ok=True)
+            with open(os.path.join(self.args.save_dir, "resolved_training_config.json"), "w") as f:
+                json.dump(config, f, indent=2)
+        else:
+            projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers, bias=proj_bias).to(device)
+            projection_layer.train()
+            if not proj_bias:
+                print("Projection layer initialized with bias=False")
+            optimizer = optim.Adam(
+                list(gpt2_model.parameters()) + list(projection_layer.parameters()),
+                lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay
+            )
 
         # ---- Contrastive setup ----
         use_contrast = getattr(self.args, "use_contrastive", False)
@@ -1278,6 +1299,7 @@ class Retrieve_Evaluator:
         import random as _random
         rng = _random.Random(self.args.seed)
 
+        best_val_token_acc = best_val_loss = None
         for epoch in range(num_epochs):
             epoch_train_correct = 0
             epoch_train_total = 0
@@ -1310,14 +1332,12 @@ class Retrieve_Evaluator:
             with torch.enable_grad():
                 for sidx, _i in enumerate(order):
                     vector_input_text, target_text, word_pairs_test, templates = train_data[_i]
+                    current_accumulation_size = accumulation_group_size(
+                        sidx, total_samples=len(order), batch_size=contrast_batch_size)
 
                     # 1. GPT-2 forward (graph will be freed when CE backward runs)
                     gpt2_inputs = gpt2_tokenizer(vector_input_text, return_tensors="pt").to(device)
-                    gpt2_outputs = gpt2_model(**gpt2_inputs)
-                    gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-
-                    # 2. Vector expansion
-                    projected_vector = projection_layer(gpt2_last_token)
+                    projected_vector = project_source(gpt2_model, gpt2_inputs, projection_layer)
                     layer_vectors = projected_vector.view(llama_num_layers, llama_hidden_size)
 
                     # 3. CE loss across templates, summed then averaged.
@@ -1325,40 +1345,73 @@ class Retrieve_Evaluator:
                     if not valid_templates:
                         valid_templates = [None]
 
-                    batch_loss = 0.0
-                    for template in valid_templates:
-                        inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                        combined_text = inference_query_text + target_text
+                    template_metrics = [0, 0]  # correct, total
 
-                        llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
-                        input_ids = llama_inputs.input_ids
-                        prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
-                        prompt_len = prompt_ids.shape[1]
+                    def template_loss_iterator():
+                        for template in valid_templates:
+                            inference_query_text, _ = self.prepare_query_text(
+                                word_pairs_test, template
+                            )
+                            combined_text = inference_query_text + target_text
 
-                        labels = input_ids.clone()
-                        labels[:, :prompt_len] = -100
-                        llama_inputs["labels"] = labels
+                            llama_inputs = llama_tokenizer(
+                                combined_text, return_tensors="pt"
+                            ).to(device)
+                            input_ids = llama_inputs.input_ids
+                            prompt_ids = llama_tokenizer(
+                                inference_query_text, return_tensors="pt"
+                            ).input_ids.to(device)
+                            prompt_len = prompt_ids.shape[1]
 
-                        edit_layers = list(range(self.model_config["n_layers"]))
-                        intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
+                            labels = input_ids.clone()
+                            labels[:, :prompt_len] = -100
+                            llama_inputs["labels"] = labels
 
-                        with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
-                            outputs = llama_model(**llama_inputs)
+                            edit_layers = list(range(self.model_config["n_layers"]))
+                            intervention_fn, _ = self.create_intervention_function(
+                                edit_layers, layer_vectors, idx=prompt_len - 1
+                            )
 
-                        batch_loss = batch_loss + outputs.loss
+                            with TraceDict(
+                                llama_model,
+                                layers=self.model_config['layer_hook_names'],
+                                edit_output=intervention_fn,
+                            ):
+                                outputs = llama_model(
+                                    **llama_inputs,
+                                    use_cache=not self.args.last_mean,
+                                )
 
-                        logits = outputs.logits
-                        next_token_logits = logits[:, prompt_len-1, :]
-                        preds = next_token_logits.argmax(dim=-1)
-                        true_id = llama_inputs["labels"][:, prompt_len]
-                        epoch_train_correct += (preds == true_id).sum().item()
-                        epoch_train_total += 1
+                            template_loss = outputs.loss
+                            next_token_logits = outputs.logits[:, prompt_len - 1, :]
+                            preds = next_token_logits.argmax(dim=-1)
+                            true_id = llama_inputs["labels"][:, prompt_len]
+                            template_metrics[0] += (preds == true_id).sum().item()
+                            template_metrics[1] += 1
 
-                    sample_ce = batch_loss / len(valid_templates)
-                    # Backward CE per sample (scaled so grads accumulate to mean over batch).
-                    # This frees the Llama+projection+gpt2 graph for this sample.
-                    (sample_ce / contrast_batch_size).backward()
-                    total_ce_loss += float(sample_ce.item())
+                            # The loss retains only what backward needs; do not keep
+                            # the large logits/output container alive across yields.
+                            del outputs, next_token_logits, preds, true_id
+                            yield template_loss
+
+                    if self.args.last_mean:
+                        sample_ce_value = backward_template_losses_memory_efficient(
+                            layer_vectors=layer_vectors,
+                            template_losses=template_loss_iterator(),
+                            template_count=len(valid_templates),
+                            accumulation_group_size=current_accumulation_size,
+                        )
+                    else:
+                        batch_loss = 0.0
+                        for template_loss in template_loss_iterator():
+                            batch_loss = batch_loss + template_loss
+                        sample_ce = batch_loss / len(valid_templates)
+                        (sample_ce / current_accumulation_size).backward()
+                        sample_ce_value = float(sample_ce.item())
+
+                    epoch_train_correct += template_metrics[0]
+                    epoch_train_total += template_metrics[1]
+                    total_ce_loss += sample_ce_value
 
                     if use_contrast:
                         ds_name = word_pairs_test.get("dataset_name", self.args.dataset_name)
@@ -1380,7 +1433,7 @@ class Retrieve_Evaluator:
                                     embeds = []
                                     for s in samples_in_batch:
                                         gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
-                                        go = gpt2_model(**gi)
+                                        go = gpt2_model(**gi, use_cache=False)
                                         embeds.append(go.last_hidden_state[:, -1, :])
                                     feats_orig = torch.cat(embeds, dim=0)
                                     B = feats_orig.shape[0]
@@ -1398,17 +1451,42 @@ class Retrieve_Evaluator:
                                             torch.tensor(cat_ids, device=device), n_cat
                                         ).float()
                                         y_mix_cat = alpha_ * y_oh_cat + (1 - alpha_) * y_oh_cat[perm]
-                                        con_ds = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
-                                        con_cat = soft_supcon_loss(feats, y_mix_cat, temperature=contrast_temperature)
+                                        if self.args.imix_key_mode == "clean":
+                                            con_ds = soft_cross_supcon_loss(
+                                                feats,
+                                                feats_orig,
+                                                y_mix_ds,
+                                                y_oh_ds,
+                                                temperature=contrast_temperature,
+                                            )
+                                            con_cat = soft_cross_supcon_loss(
+                                                feats,
+                                                feats_orig,
+                                                y_mix_cat,
+                                                y_oh_cat,
+                                                temperature=contrast_temperature,
+                                            )
+                                        else:
+                                            con_ds = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
+                                            con_cat = soft_supcon_loss(feats, y_mix_cat, temperature=contrast_temperature)
                                         con_term = con_ds + hierarchical_beta * con_cat
                                     else:
-                                        con_term = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
+                                        if self.args.imix_key_mode == "clean":
+                                            con_term = soft_cross_supcon_loss(
+                                                feats,
+                                                feats_orig,
+                                                y_mix_ds,
+                                                y_oh_ds,
+                                                temperature=contrast_temperature,
+                                            )
+                                        else:
+                                            con_term = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
                                 elif use_simcse:
                                     embeds_a, embeds_b = [], []
                                     for s in samples_in_batch:
                                         gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
-                                        go_a = gpt2_model(**gi)
-                                        go_b = gpt2_model(**gi)
+                                        go_a = gpt2_model(**gi, use_cache=False)
+                                        go_b = gpt2_model(**gi, use_cache=False)
                                         embeds_a.append(go_a.last_hidden_state[:, -1, :])
                                         embeds_b.append(go_b.last_hidden_state[:, -1, :])
                                     feats = torch.cat(embeds_a + embeds_b, dim=0)
@@ -1418,7 +1496,7 @@ class Retrieve_Evaluator:
                                     embeds = []
                                     for s in samples_in_batch:
                                         gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
-                                        go = gpt2_model(**gi)
+                                        go = gpt2_model(**gi, use_cache=False)
                                         embeds.append(go.last_hidden_state[:, -1, :])
                                     feats = torch.cat(embeds, dim=0)
                                     if level == "hierarchical":
@@ -1467,11 +1545,7 @@ class Retrieve_Evaluator:
                     for vector_input_text, target_text, word_pairs_test, templates in val_data:
                         # 1. Vector generation
                         gpt2_inputs = gpt2_tokenizer(vector_input_text, return_tensors="pt").to(device)
-                        gpt2_outputs = gpt2_model(**gpt2_inputs)
-                        gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-                        
-                        # 2. Vector expansion
-                        projected_vector = projection_layer(gpt2_last_token)
+                        projected_vector = project_source(gpt2_model, gpt2_inputs, projection_layer)
                         layer_vectors = projected_vector.view(llama_num_layers, llama_hidden_size)
                         
                         # Calculate validation loss with various templates
@@ -1499,7 +1573,7 @@ class Retrieve_Evaluator:
 
                             # Apply intervention
                             edit_layers = list(range(self.model_config["n_layers"]))
-                            intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
+                            intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors, idx=prompt_len - 1)
 
                             with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn):
                                 outputs = llama_model(**llama_inputs)
@@ -1526,23 +1600,25 @@ class Retrieve_Evaluator:
 
                     print(f"Epoch {epoch + 1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}, Validation Token Acc: {avg_val_token_acc:.4f}")
                         
-                    checkpoint = {
-                        'epoch': epoch,
-                        'gpt2_model_state_dict': gpt2_model.state_dict(),
-                        'projection_layer_state_dict': projection_layer.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loss': avg_train_loss,
-                        'val_loss': avg_val_loss,
-                    }
-                    
-                    if self.args.save_model or epoch + 1 == 10:
-                        os.makedirs(self.args.save_dir, exist_ok=True)
-                        torch.save(checkpoint, os.path.join(self.args.save_dir, f'best_model_epoch_{epoch+1}.pt'))
-                        print(f"Saved model at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
-
-        os.makedirs(self.args.save_dir, exist_ok=True)  
-        torch.save(checkpoint, os.path.join(self.args.save_dir, f'best_model_epoch.pt'))
-        print(f"Saved model at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
+                    if self.args.last_mean:
+                        checkpoint = build_last_mean_checkpoint(
+                            gpt2_model, projection_layer, config, epoch + 1,
+                            train_loss=avg_train_loss, val_loss=avg_val_loss,
+                            train_token_acc=avg_train_token_acc, val_token_acc=avg_val_token_acc)
+                    else:
+                        checkpoint = {
+                            "epoch": epoch, "gpt2_model_state_dict": gpt2_model.state_dict(),
+                            "projection_layer_state_dict": projection_layer.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "train_loss": avg_train_loss, "val_loss": avg_val_loss,
+                        }
+                    if is_better_validation_candidate(
+                        avg_val_token_acc, float(avg_val_loss), best_val_token_acc, best_val_loss):
+                        best_val_token_acc, best_val_loss = avg_val_token_acc, float(avg_val_loss)
+                        atomic_torch_save(checkpoint, os.path.join(self.args.save_dir, "best_model_epoch.pt"))
+                        print(f"Saved best validation checkpoint at epoch {epoch + 1}")
+                    if self.args.save_model or epoch + 1 == num_epochs:
+                        atomic_torch_save(checkpoint, os.path.join(self.args.save_dir, f"model_epoch_{epoch + 1}.pt"))
 
         end_time = time.time()
         training_time = end_time - start_time
@@ -1630,6 +1706,12 @@ if __name__ == "__main__":
     parser.add_argument("--bias_free_projection", action='store_true',
                         help="Use Linear(..., bias=False) for projection layer.")
 
+    parser.add_argument("--last_mean", action="store_true", help="Use the final Joint-256 Last-Mean model with GPT-2 LoRA.")
+    parser.add_argument("--readout_mean_alpha", type=float, default=0.7)
+    parser.add_argument("--gpt2_model_name", default="gpt2")
+    parser.add_argument("--gpt2_learning_rate", type=float, default=8e-4)
+    parser.add_argument("--imix_key_mode", choices=["clean", "mixed"], default="mixed")
+    parser.add_argument("--train_only", action="store_true", help="Train and validate without test evaluation.")
     args = parser.parse_args()
     seed_everything(seed=args.seed)
     output_file = f"{args.save_dir}/{args.model_name.split('/')[-1]}_{args.dataset_name}_{args.retrieve_method}_{args.shots}shots_{args.weight_ori}ori_{args.weight_fv}fv_{args.recall}recall.json"
@@ -1638,5 +1720,6 @@ if __name__ == "__main__":
         assert False
 
     evaluator = Retrieve_Evaluator(args)
-    results = evaluator.evaluate()
-    evaluator.save_results(results)
+    if not args.train_only:
+        results = evaluator.evaluate()
+        evaluator.save_results(results)

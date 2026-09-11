@@ -23,7 +23,8 @@ def load_model_and_tokenizer(
         model_name: str,
         model_dtype = torch.float16,
         device = "cuda:0",
-        use_vllm=False
+        use_vllm=False,
+        force_single_gpu=False,
 ):
     print("Loading:", model_name)
     if "llama" in model_name:
@@ -43,7 +44,8 @@ def load_model_and_tokenizer(
             if not tokenizer.pad_token_id:
                 print(f"Tokenizer's pad id change to {tokenizer.eos_token_id}")
                 tokenizer.pad_token_id = tokenizer.eos_token_id
-            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype, device_map="auto")
+            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype,
+                                                        device_map={"": device} if force_single_gpu else "auto")
         
         MODEL_CONFIG = {
             "n_heads": model.config.num_attention_heads,

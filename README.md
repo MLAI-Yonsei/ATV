@@ -1,24 +1,18 @@
 # ATV
 Code repositories for __ATV (Adaptive Task Vectors).__
 
-## Results
+This branch implements Llama-3-8B ATV with the paper's GPT-2 Last-Mean readout.
+The last-token and masked-mean states are projected to 256 dimensions, combined
+with mean weight 0.7, and mapped to the target layers through a shared projection.
+No additional normalization or category subtraction is applied.
 
-`Paper ATV` denotes the original Llama-3 ATV results reported in the paper, without i-mix or category subtraction.
-`i-mix + Category subtraction` uses the integrated i-mix checkpoint and JSON-selected mean category subtraction settings.
-
-### In-domain
-
-| Row | NLU | Reasoning | Knowledge | Math | Safety | Avg |
-|---|---:|---:|---:|---:|---:|---:|
-| Paper ATV | 61.0 ± 5.0 | 76.1 ± 1.3 | 73.0 ± 1.6 | 25.8 ± 2.0 | 74.8 ± 0.4 | 62.1 ± 1.5 |
-| i-mix + Category subtraction | 63.6 ± 5.8 | 78.6 ± 2.7 | 77.3 ± 2.0 | 28.4 ± 1.5 | 76.7 ± 1.5 | 64.9 ± 0.9 |
-
-### OOD
-
-| Row | GLUE CoLA | BBQ Religion | DeepMind | MMLU Psych | BBH Five Objects | Avg |
-|---|---:|---:|---:|---:|---:|---:|
-| Paper ATV | 77.6 ± 2.7 | 80.8 ± 2.6 | 26.4 ± 2.7 | 80.6 ± 2.3 | 51.7 ± 3.1 | 63.4 ± 2.5 |
-| i-mix + Category subtraction | 82.7 ± 9.7 | 84.0 ± 0.7 | 31.0 ± 2.5 | 83.1 ± 2.3 | 52.0 ± 2.8 | 66.6 ± 2.7 |
+The injection follows the paper: it modifies only the last prompt token at each
+target layer, which predicts the first answer token. Training and validation use
+`prompt_len - 1` in the prompt-plus-answer sequence. Inference uses the final
+prompt position, and subsequent generation proceeds without the hook.
+This replaces the earlier sequence-wide broadcasting behavior. Existing
+checkpoint weights can be loaded, but their scores under this injection rule
+require reevaluation.
 
 ## Requirements
 
@@ -41,13 +35,36 @@ conda activate ATV
    ```bash
    ./scripts/ATV_training.sh
    ```
-Running the above script trains the model on all 20 in-domain datasets. After training, evaluation is performed on the test samples from all in-domain datasets.
+Running the above script trains the model on all 20 in-domain datasets using
+seeds 42, 100, and 10. It uses GPT-2 LoRA with rank 16, alpha 32, and dropout 0.05;
+AdamW with learning rates 8e-4 for LoRA and 1e-3 for the projections; and an
+effective batch size of 16 for 15 epochs. The objective combines answer-token CE
+with i-Mix on the last-token states using clean keys, temperature 0.1, mixup alpha
+0.5, and loss weight 1.0. The intervention weight is 0.001.
+
+`best_model_epoch.pt` is selected by validation token accuracy, with validation
+loss breaking ties. Evaluation is run separately with the script below.
+
+Both scripts default to GPU 0. Set `GPUS` and `SEEDS` to select GPUs and runs:
+
+```bash
+GPUS="0 1 2" SEEDS="42 100 10" ./scripts/ATV_training.sh
+```
+
+`ATV_LLAMA_MODEL` and `ATV_GPT2_MODEL` can point to local model directories.
+The defaults are `meta-llama/Meta-Llama-3-8B` and `gpt2`.
 
 ### Evaluate all datasets
    ```bash
    ./scripts/ATV_evaluate.sh
    ```
-Running the above script enables evaluation of performance on each individual dataset within the full collection.
+Running the above script evaluates the best validation checkpoint on all 25
+datasets. The readout configuration is loaded from the checkpoint, including
+mean weight 0.7. Existing full GPT-2 checkpoints remain loadable.
+
+The dataset preparation and evaluation splits retain the existing repository
+behavior. Use the finalized evaluation data when comparing with the revised
+paper, which uses corrected GLUE evaluation sets.
 
 ### Analyze results
    ```bash
