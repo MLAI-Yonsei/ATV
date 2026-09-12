@@ -1,4 +1,8 @@
 import torch
+from utils.last_mean import (LastMeanProjection, project_source, apply_gpt2_lora,
+    build_last_mean_optimizer, last_mean_config, build_last_mean_checkpoint,
+    atomic_torch_save, is_better_validation_candidate, accumulation_group_size,
+    backward_template_losses_memory_efficient, soft_cross_supcon_loss)
 import torch.nn.functional as F
 import numpy as np
 from cuml.manifold import TSNE as cumlTSNE
@@ -37,6 +41,87 @@ import numpy as np
 import copy
 
 MAX_NEW_TOKENS = 256
+
+
+def soft_supcon_loss(features, soft_labels, temperature=0.1):
+    """SupCon with soft positive weights (for label-mixed samples).
+
+    Args:
+        features    : [N, D] float
+        soft_labels : [N, C] float (rows sum to 1; e.g., mix of one-hots)
+        temperature : τ
+
+    Positive weight between i,j is soft_labels[i] · soft_labels[j]. Diagonal masked.
+    """
+    device = features.device
+    N = features.shape[0]
+    if N < 2:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+    z = torch.nn.functional.normalize(features.float(), dim=-1)
+    sim = z @ z.T / temperature                                 # [N, N]
+    self_mask = torch.eye(N, dtype=torch.bool, device=device)
+    not_self = (~self_mask).float()
+    sim_for_max = sim.masked_fill(self_mask, float("-inf"))
+    sim_max = sim_for_max.detach().max(dim=1, keepdim=True).values
+    sim_stable = sim - sim_max
+    exp_sim = sim_stable.exp() * not_self
+    denom = exp_sim.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    log_prob = sim_stable - denom.log()                         # [N, N]
+
+    pos_w = (soft_labels.float() @ soft_labels.float().T) * not_self  # [N, N]
+    w_sum = pos_w.sum(dim=1).clamp_min(1e-8)                          # [N]
+    valid = pos_w.sum(dim=1) > 1e-8
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+    pos_log_prob = (log_prob * pos_w).sum(dim=1) / w_sum              # [N]
+    return -pos_log_prob[valid].mean()
+
+
+def supcon_loss(features, labels, temperature=0.1):
+    """Supervised Contrastive Loss (Khosla et al. 2020).
+
+    Args:
+        features : [N, D] float tensor (will be L2-normalized).
+        labels   : [N] int tensor of class IDs.
+        temperature: τ.
+
+    Returns 0-dim loss tensor. Returns 0 if no positive pairs exist
+    (e.g., all labels distinct or batch too small).
+    """
+    device = features.device
+    N = features.shape[0]
+    if N < 2:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+
+    z = torch.nn.functional.normalize(features.float(), dim=-1)
+    sim = z @ z.T / temperature                                           # [N, N]
+
+    self_mask = torch.eye(N, dtype=torch.bool, device=device)
+    not_self = (~self_mask).float()                                       # [N, N]
+
+    # Numerical stability: subtract per-row max from finite (non-self) entries.
+    sim_for_max = sim.masked_fill(self_mask, float("-inf"))
+    sim_max = sim_for_max.detach().max(dim=1, keepdim=True).values        # [N, 1]
+    sim_stable = sim - sim_max
+
+    # exp, with diagonal zeroed out. Never produce -inf.
+    exp_sim = sim_stable.exp() * not_self                                  # [N, N]
+    denom = exp_sim.sum(dim=1, keepdim=True).clamp_min(1e-12)              # [N, 1]
+    log_prob = sim_stable - denom.log()                                    # [N, N]
+    # log_prob diagonal is finite garbage (we never use it via pos_mask=0).
+
+    labels = labels.view(-1)
+    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
+    n_pos_per_anchor = pos_mask.sum(dim=1)
+
+    valid = n_pos_per_anchor > 0
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=False)
+
+    pos_log_prob = (log_prob * pos_mask.float()).sum(dim=1)
+    loss_per_anchor = -pos_log_prob[valid] / n_pos_per_anchor[valid].float()
+    return loss_per_anchor.mean()
+
 
 def test_answer(pred_str, ans, natural_prompt):
     try:
@@ -279,7 +364,8 @@ class Retrieve_Evaluator:
 
     def load_model(self):
         print("Loading Model and Tokenizer...")
-        return load_model_and_tokenizer(self.args.model_name, device=self.args.device)
+        return load_model_and_tokenizer(self.args.model_name, device=self.args.device,
+                                        force_single_gpu=self.args.last_mean)
 
     def load_dataset(self):
         if self.args.specific_data == None:
@@ -294,7 +380,11 @@ class Retrieve_Evaluator:
             safety_tasks = ["crows_pairs", "bbq_age", "ethics_justice", "ethics_commonsense"]
             language_tasks = ["superglue_rte", "superglue_wic", "glue_qnli", "glue_sst2", "glue_mnli"]
 
-            dataset_list = knowledge_tasks + reasoning_tasks + mathematic_tasks + safety_tasks + language_tasks
+            if getattr(self.args, 'train_datasets', None):
+                dataset_list = [d.strip() for d in self.args.train_datasets.split(',') if d.strip()]
+                print(f"Override dataset_list -> {dataset_list}")
+            else:
+                dataset_list = knowledge_tasks + reasoning_tasks + mathematic_tasks + safety_tasks + language_tasks
 
             all_datasets = {}
 
@@ -305,7 +395,7 @@ class Retrieve_Evaluator:
                                      test_split=self.args.test_split, seed=self.args.seed)
 
                 # Process each split
-                for split in ["train", "valid", self.args.dataset_split]:
+                for split in (["train", "valid"] if self.args.train_only else ["train", "valid", self.args.dataset_split]):
                     if split in dataset and hasattr(dataset[split], "raw_data"):
                         # Add dataset name
                         dataset[split].raw_data['dataset_name'] = dataset_name
@@ -704,11 +794,11 @@ class Retrieve_Evaluator:
 
         return results
 
-    def create_intervention_function(self, edit_layer, tv):
+    def create_intervention_function(self, edit_layer, tv, idx=-1):
         if type(edit_layer) is list:
             # print("Edit Layer: ", edit_layer)
             # return add_function_vector(edit_layer, tv, device=self.model.device, idx=-1, weight_fv=args.weight_fv, weight_ori=args.weight_ori, norm=True), edit_layer
-            return add_function_vector(edit_layer, tv, device=self.model.device, idx=-1, weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False), edit_layer
+            return add_function_vector(edit_layer, tv, device=self.model.device, idx=idx, weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False), edit_layer
         else:
             if self.args.retrieve_method == "retriever" and self.args.n_layers is not None:
                 temp_tv = tv
@@ -721,7 +811,7 @@ class Retrieve_Evaluator:
                 factor = 1
                 norm = False
         print("Edit Layer: ", intervene_layers)
-        return add_function_vector(intervene_layers, temp_tv, device=self.model.device, idx=-1,
+        return add_function_vector(intervene_layers, temp_tv, device=self.model.device, idx=idx,
                                    weight_fv=self.args.weight_fv / factor, weight_ori=self.args.weight_ori, norm=norm), intervene_layers
 
     def record_output(self, results, query_text, clean_output, intervention_output, task_label, target, intervene_layers):
@@ -1038,10 +1128,7 @@ class Retrieve_Evaluator:
 
     def adaptive_retrieval(self, query_text):
         gpt2_inputs = self.gpt_2_tokenizer(query_text, return_tensors="pt").to(self.model.device)
-        gpt2_outputs = self.gpt2_model(**gpt2_inputs)
-        gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-
-        projected_vector = self.projection_layer(gpt2_last_token)
+        projected_vector = project_source(self.gpt2_model, gpt2_inputs, self.projection_layer)
         layer_vectors = projected_vector.view(self.model_config["n_layers"], self.model_config["hidden_dim"])
 
         icl_best_layer = None
@@ -1054,7 +1141,7 @@ class Retrieve_Evaluator:
     def adaptive_training(self):
         print("Loading ICV dataset...")
 
-        train_split, valid_split, test_split = self.dataset['train'], self.dataset['valid'], self.dataset['test']
+        train_split, valid_split, test_split = self.dataset['train'], self.dataset['valid'], self.dataset.get('test', [])
 
         # Simple template for vector generation
         vector_template = "Q: {input} \n A: "
@@ -1113,9 +1200,12 @@ class Retrieve_Evaluator:
 
         # Model initialization (same as before)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        gpt2_tokenizer = GPT2Tokenizer.from_pretrained(self.args.gpt2_model_name)
         gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
-        gpt2_model = GPT2Model.from_pretrained("gpt2").to(device)
+        gpt2_model = GPT2Model.from_pretrained(self.args.gpt2_model_name)
+        if self.args.last_mean:
+            gpt2_model = apply_gpt2_lora(gpt2_model, rank=16, alpha=32, dropout=0.05)
+        gpt2_model = gpt2_model.to(device)
         gpt2_model.train()
         llama_model = self.model
         llama_tokenizer = self.tokenizer
@@ -1123,29 +1213,159 @@ class Retrieve_Evaluator:
         llama_model.eval()
         for param in llama_model.parameters():
             param.requires_grad = False
-
-        use_gradient_checkpointing = getattr(self.args, "gradient_checkpointing", False)
+        use_gradient_checkpointing = self.args.gradient_checkpointing
         if use_gradient_checkpointing:
-            if not hasattr(llama_model, "gradient_checkpointing_enable"):
-                raise ValueError("The selected LLaMA model does not support gradient checkpointing.")
             llama_model.config.use_cache = False
             llama_model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-            print("Enabled LLaMA gradient checkpointing for adaptive training.")
-
+        batch_size = self.args.batch_size
+        if batch_size < 1 or self.args.contrastive_batch_size < 1:
+            raise ValueError("Batch sizes must be positive")
         gpt2_hidden_size = gpt2_model.config.hidden_size
         llama_hidden_size = llama_model.config.hidden_size
         llama_num_layers = llama_model.config.num_hidden_layers
-        projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers).to(device)
-        projection_layer.train()
-        optimizer = optim.Adam(
-            list(gpt2_model.parameters()) + list(projection_layer.parameters()),
-            lr=self.args.learning_rate,
-            weight_decay=self.args.weight_decay
-        )
+        proj_bias = not getattr(self.args, "bias_free_projection", False)
+        if self.args.last_mean:
+            if not proj_bias:
+                raise ValueError("Last-Mean requires the trained projection bias configuration")
+            projection_layer = LastMeanProjection(
+                gpt2_hidden_size, llama_hidden_size * llama_num_layers,
+                mean_alpha=self.args.readout_mean_alpha,
+            ).to(device)
+            optimizer = build_last_mean_optimizer(
+                gpt2_model, projection_layer, self.args.gpt2_learning_rate,
+                self.args.learning_rate, self.args.weight_decay,
+            )
+            config = last_mean_config(self.args, gpt2_model, llama_model)
+            os.makedirs(self.args.save_dir, exist_ok=True)
+            with open(os.path.join(self.args.save_dir, "resolved_training_config.json"), "w") as f:
+                json.dump(config, f, indent=2)
+        else:
+            projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers, bias=proj_bias).to(device)
+            projection_layer.train()
+            if not proj_bias:
+                print("Projection layer initialized with bias=False")
+            optimizer = optim.Adam(
+                list(gpt2_model.parameters()) + list(projection_layer.parameters()),
+                lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay
+            )
 
-        batch_size = self.args.batch_size
+        # ---- Contrastive setup ----
+        use_contrast = getattr(self.args, "use_contrastive", False)
+        contrast_lambda = float(getattr(self.args, "contrastive_lambda", 0.0))
+        contrast_lambda_end = getattr(self.args, "contrastive_lambda_end", None)
+        contrast_temperature = float(getattr(self.args, "contrastive_temperature", 0.1))
+        contrast_batch_size = int(getattr(self.args, "contrastive_batch_size", 32))
+        if not use_contrast and not self.args.last_mean:
+            contrast_batch_size = batch_size
+        use_simcse = bool(getattr(self.args, "use_simcse", False))
+        use_imix = bool(getattr(self.args, "use_imix", False))
+        imix_alpha = float(getattr(self.args, "imix_alpha", 0.2))
+        hierarchical_beta = float(getattr(self.args, "hierarchical_beta", 0.5))
+        if use_contrast:
+            level = getattr(self.args, "contrastive_level", "dataset")
+            # 5-category mapping (matches ATV_analysis.py)
+            CATEGORY_MAP = {
+                "superglue_rte": "nlu", "superglue_wic": "nlu", "glue_qnli": "nlu",
+                "glue_sst2": "nlu", "glue_mnli": "nlu",
+                "arc_challenge": "reasoning", "bbh_boolean_expressions": "reasoning",
+                "bbh_date_understanding": "reasoning",
+                "bbh_reasoning_about_colored_objects": "reasoning",
+                "bbh_temporal_sequences": "reasoning",
+                "boolq": "knowledge", "commonsense_qa": "knowledge",
+                "hellaswag": "knowledge", "openbookqa": "knowledge",
+                "math_qa": "math", "mmlu_pro_math": "math",
+                "crows_pairs": "safety", "bbq_age": "safety",
+                "ethics_justice": "safety", "ethics_commonsense": "safety",
+            }
+            if level == "category":
+                def label_for(ds_name):
+                    return CATEGORY_MAP.get(ds_name, ds_name)
+            else:
+                def label_for(ds_name):
+                    return ds_name
+
+            unique_names = sorted({label_for(sample[2].get("dataset_name", self.args.dataset_name))
+                                   for sample in train_data})
+            name_to_id = {n: i for i, n in enumerate(unique_names)}
+
+            # For hierarchical, also build category id mapping (independent of dataset id)
+            cat_to_id = {}
+            if level == "hierarchical":
+                unique_cats = sorted({CATEGORY_MAP.get(sample[2].get("dataset_name", self.args.dataset_name),
+                                                       sample[2].get("dataset_name", self.args.dataset_name))
+                                      for sample in train_data})
+                cat_to_id = {c: i for i, c in enumerate(unique_cats)}
+
+            anneal_str = f" → {contrast_lambda_end}" if contrast_lambda_end is not None else ""
+            simcse_str = " +SimCSE" if use_simcse else ""
+            imix_str = f" +iMix(α={imix_alpha})" if use_imix else ""
+            hier_str = f" +HierBeta={hierarchical_beta} ({len(cat_to_id)} cats)" if level == "hierarchical" else ""
+            print(f"Contrastive ON: level={level}  λ={contrast_lambda}{anneal_str}  τ={contrast_temperature}  batch={contrast_batch_size}{simcse_str}{imix_str}{hier_str}  classes={len(unique_names)} ({unique_names})")
+        else:
+            name_to_id = {}
+            def label_for(ds_name):
+                return ds_name
+
+        def sample_batches(indices, group_size):
+            for group_start in range(0, len(indices), group_size):
+                group_end = min(group_start + group_size, len(indices))
+                for start in range(group_start, group_end, batch_size):
+                    yield start, indices[start:min(start + batch_size, group_end)]
+
+        def template_losses(current_batch, layer_vectors, metrics):
+            pairs = []
+            for sample_idx, (_, target_text, item, templates) in enumerate(current_batch):
+                valid_templates = [t for t in templates if t is not None] or [None]
+                for template in valid_templates:
+                    prompt, _ = self.prepare_query_text(item, template)
+                    pairs.append((sample_idx, prompt, target_text, len(valid_templates)))
+            groups = [pairs] if self.args.llama_batch else [[pair] for pair in pairs]
+            for group in groups:
+                texts = [prompt + target for _, prompt, target, _ in group]
+                prompt_lens = [llama_tokenizer(prompt, return_tensors="pt").input_ids.shape[1]
+                               for _, prompt, _, _ in group]
+                llama_inputs = llama_tokenizer(
+                    texts if self.args.llama_batch else texts[0],
+                    return_tensors="pt", padding=self.args.llama_batch,
+                ).to(device)
+                labels = llama_inputs.input_ids.clone()
+                pad_lens = (llama_inputs.attention_mask == 0).sum(dim=1)
+                prompt_ends = pad_lens + torch.tensor(prompt_lens, device=device)
+                for row, end in enumerate(prompt_ends):
+                    labels[row, :end] = -100
+                labels[llama_inputs.attention_mask == 0] = -100
+
+                sample_indices = torch.tensor([pair[0] for pair in group], device=device)
+                vectors = layer_vectors[sample_indices]
+                positions = prompt_ends - 1
+                intervention_fn, _ = self.create_intervention_function(
+                    list(range(self.model_config["n_layers"])), vectors, idx=positions)
+                if not self.args.llama_batch:
+                    llama_inputs["labels"] = labels
+                with TraceDict(llama_model, layers=self.model_config['layer_hook_names'],
+                               edit_output=intervention_fn, retain_output=False):
+                    outputs = llama_model(**llama_inputs, **self.forward_kwargs(logits_to_keep=False))
+                    rows = torch.arange(len(group), device=device)
+                    predictions = outputs.logits[rows, positions].argmax(dim=-1)
+                    metrics[0] += (predictions == labels[rows, prompt_ends]).sum().item()
+                    metrics[1] += len(group)
+                    if self.args.llama_batch:
+                        shift_logits = outputs.logits[:, :-1, :].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
+                        ce = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.shape[-1]), shift_labels.view(-1),
+                            ignore_index=-100, reduction="none").view(len(group), -1)
+                        per_sequence_loss = ce.sum(dim=1) / (shift_labels != -100).sum(dim=1)
+                        template_counts = per_sequence_loss.new_tensor([pair[3] for pair in group])
+                        loss = (per_sequence_loss / template_counts).sum()
+                        del shift_logits, shift_labels, ce, per_sequence_loss
+                    else:
+                        loss = outputs.loss * (len(groups) / group[0][3])
+                    del outputs, predictions
+                    yield loss
 
         ####################################
         # Training & Validation Loop
@@ -1153,188 +1373,195 @@ class Retrieve_Evaluator:
         import time
         from datetime import timedelta
 
-        print(f"Training... (batch_size={batch_size})")
+        print("Training...")
         num_epochs = self.args.epochs
         train_loss_lst = []
         val_loss_lst = []
         start_time = time.time()
 
+        import random as _random
+        rng = _random.Random(self.args.seed)
+
+        best_val_token_acc = best_val_loss = None
         for epoch in range(num_epochs):
             epoch_train_correct = 0
             epoch_train_total = 0
 
+            # Linearly anneal λ if --contrastive_lambda_end given
+            if contrast_lambda_end is not None and num_epochs > 1:
+                t = epoch / (num_epochs - 1)
+                lambda_now = (1 - t) * contrast_lambda + t * contrast_lambda_end
+            else:
+                lambda_now = contrast_lambda
+
             # Training
-            total_loss = 0.0
+            total_ce_loss = 0.0
+            total_contrast_loss = 0.0
+            n_steps = 0
             gpt2_model.train()
             projection_layer.train()
-            if use_gradient_checkpointing:
-                llama_model.train()
-            else:
-                llama_model.eval()
+            llama_model.train(use_gradient_checkpointing)
+
+            # Shuffle each epoch so contrastive batches contain multiple datasets
+            order = list(range(len(train_data)))
+            rng.shuffle(order)
+
+            # Per-batch buffers for SupCon: re-run GPT-2 (with grad) only at batch boundary
+            # to avoid keeping 32 Llama forward graphs simultaneously.
+            samples_in_batch = []   # list of (input_text, dataset_id) for SupCon re-forward
+            sample_count = 0
+
+            optimizer.zero_grad()
 
             with torch.enable_grad():
-                # Process train_data in batches
-                for batch_start in range(0, len(train_data), batch_size):
-                    batch_end = min(batch_start + batch_size, len(train_data))
-                    current_batch = train_data[batch_start:batch_end]
-                    B = len(current_batch)
-
-                    optimizer.zero_grad()
-
-                    # 1. Batched GPT-2 forward
-                    gpt2_texts = [item[0] for item in current_batch]
-                    gpt2_inputs = gpt2_tokenizer(gpt2_texts, return_tensors="pt", padding=True).to(device)
-                    gpt2_outputs = gpt2_model(**gpt2_inputs)
-                    # Extract last real token per sample
-                    gpt2_lengths = gpt2_inputs.attention_mask.sum(dim=1) - 1  # [B]
-                    gpt2_last_tokens = gpt2_outputs.last_hidden_state[torch.arange(B), gpt2_lengths]  # [B, 768]
-
-                    # 2. Batched projection
-                    projected_vectors = projection_layer(gpt2_last_tokens)  # [B, 32*4096]
-                    all_layer_vectors = projected_vectors.view(B, llama_num_layers, llama_hidden_size)  # [B, 32, 4096]
-
-                    # 3. LLaMA forward with intervention
-                    backward_done = False
-                    loss = None
-                    if self.args.llama_batch:
-                        # Batched: flatten (sample × template) pairs for one LLaMA forward
-                        all_combined_texts = []
-                        all_prompt_lens = []
-                        all_n_templates = []
-
-                        for sample_idx in range(B):
-                            vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
-                            valid_templates = [t for t in templates if t is not None]
-                            if not valid_templates:
-                                valid_templates = [None]
-                            all_n_templates.append(len(valid_templates))
-
-                            for template in valid_templates:
-                                inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                                combined_text = inference_query_text + target_text
-                                prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids
-                                all_combined_texts.append(combined_text)
-                                all_prompt_lens.append(prompt_ids.shape[1])
-
-                        N = len(all_combined_texts)
-                        llama_inputs = llama_tokenizer(all_combined_texts, return_tensors="pt", padding=True).to(device)
-
-                        labels = llama_inputs.input_ids.clone()
-                        pad_lens = (llama_inputs.attention_mask == 0).sum(dim=1)
-                        for i in range(N):
-                            labels[i, :pad_lens[i] + all_prompt_lens[i]] = -100
-
-                        expanded_vectors = all_layer_vectors.repeat_interleave(
-                            torch.tensor(all_n_templates, device=device), dim=0)
-
-                        edit_layers = list(range(self.model_config["n_layers"]))
-                        intervention_fn = add_function_vector(edit_layers, expanded_vectors,
-                            device=self.model.device, idx=-1,
-                            weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False)
-
-                        with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn, retain_output=False):
-                            outputs = llama_model(**llama_inputs, **self.forward_kwargs(logits_to_keep=False))
-
-                            logits = outputs.logits
-                            vocab_size = logits.size(-1)
-                            shift_logits = logits[:, :-1, :].contiguous()
-                            shift_labels = labels[:, 1:].contiguous()
-
-                            ce = F.cross_entropy(
-                                shift_logits.view(-1, vocab_size), shift_labels.view(-1),
-                                ignore_index=-100, reduction='none').view(N, -1)
-                            valid_tokens = (shift_labels != -100).float()
-                            per_seq_loss = (ce * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1)
-
-                            acc_positions = pad_lens + torch.tensor(all_prompt_lens, device=device) - 1
-                            label_positions = pad_lens + torch.tensor(all_prompt_lens, device=device)
-                            next_token_logits = logits[torch.arange(N, device=device), acc_positions]
-                            true_ids = labels[torch.arange(N, device=device), label_positions]
-                            epoch_train_correct += (next_token_logits.argmax(dim=-1) == true_ids).sum().item()
-                            epoch_train_total += N
-
-                            batch_loss = 0.0
-                            offset = 0
-                            for sample_idx in range(B):
-                                nt = all_n_templates[sample_idx]
-                                batch_loss += per_seq_loss[offset:offset + nt].sum() / nt
-                                offset += nt
-
-                            loss = batch_loss / B
-                            if use_gradient_checkpointing:
-                                loss.backward()
-                                backward_done = True
-
-                    else:
-                        # Sequential: per-sample, per-template LLaMA forward (original behavior)
-                        batch_loss = 0.0
-                        backward_steps = sum(
-                            len([t for t in item[3] if t is not None]) or 1
-                            for item in current_batch
+                for sidx, indices in sample_batches(order, contrast_batch_size):
+                    current_batch = [train_data[i] for i in indices]
+                    current_accumulation_size = accumulation_group_size(
+                        sidx, total_samples=len(order), batch_size=contrast_batch_size)
+                    texts = [item[0] for item in current_batch]
+                    gpt2_inputs = gpt2_tokenizer(
+                        texts if len(texts) > 1 else texts[0], return_tensors="pt", padding=True,
+                    ).to(device)
+                    projected_vectors = project_source(gpt2_model, gpt2_inputs, projection_layer)
+                    layer_vectors = projected_vectors.view(len(indices), llama_num_layers, llama_hidden_size)
+                    template_metrics = [0, 0]
+                    template_count = (1 if self.args.llama_batch else sum(
+                        len([t for t in item[3] if t is not None]) or 1 for item in current_batch))
+                    losses = template_losses(current_batch, layer_vectors, template_metrics)
+                    if self.args.last_mean or use_gradient_checkpointing:
+                        batch_ce_value = backward_template_losses_memory_efficient(
+                            layer_vectors=layer_vectors,
+                            template_losses=losses,
+                            template_count=template_count,
+                            accumulation_group_size=current_accumulation_size,
                         )
-                        backward_step = 0
+                    else:
+                        batch_ce = sum(losses) / template_count
+                        (batch_ce / current_accumulation_size).backward()
+                        batch_ce_value = float(batch_ce.item())
 
-                        for sample_idx in range(B):
-                            vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
-                            layer_vectors = all_layer_vectors[sample_idx]
+                    epoch_train_correct += template_metrics[0]
+                    epoch_train_total += template_metrics[1]
+                    total_ce_loss += batch_ce_value
 
-                            valid_templates = [t for t in templates if t is not None]
-                            if not valid_templates:
-                                valid_templates = [None]
+                    if use_contrast:
+                        for vector_input_text, _, word_pairs_test, _ in current_batch:
+                            ds_name = word_pairs_test.get("dataset_name", self.args.dataset_name)
+                            ds_id = name_to_id[label_for(ds_name)]
+                            cat_id = cat_to_id.get(CATEGORY_MAP.get(ds_name, ds_name), -1) if level == "hierarchical" else -1
+                            samples_in_batch.append((vector_input_text, ds_id, cat_id))
+                    sample_count += len(indices)
 
-                            sample_loss = 0.0
-                            for template in valid_templates:
-                                inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                                combined_text = inference_query_text + target_text
-
-                                llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
-                                input_ids = llama_inputs.input_ids
-                                prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
-                                prompt_len = prompt_ids.shape[1]
-
-                                labels = input_ids.clone()
-                                labels[:, :prompt_len] = -100
-                                llama_inputs["labels"] = labels
-
-                                edit_layers = list(range(self.model_config["n_layers"]))
-                                intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
-
-                                with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn, retain_output=False):
-                                    outputs = llama_model(**llama_inputs, **self.forward_kwargs(logits_to_keep=False))
-
-                                    template_loss = outputs.loss
-                                    logits = outputs.logits
-                                    next_token_logits = logits[:, prompt_len-1, :]
-                                    preds = next_token_logits.argmax(dim=-1)
-                                    true_id = llama_inputs["labels"][:, prompt_len]
-                                    if use_gradient_checkpointing:
-                                        sample_loss += template_loss.detach()
-                                        scaled_loss = template_loss / (B * len(valid_templates))
-                                        backward_step += 1
-                                        scaled_loss.backward(retain_graph=backward_step < backward_steps)
+                    is_last = (sidx + len(indices) == len(order))
+                    if sample_count >= contrast_batch_size or is_last:
+                        if use_contrast and len(samples_in_batch) >= 2:
+                            ds_ids = [s[1] for s in samples_in_batch]
+                            cat_ids = [s[2] for s in samples_in_batch]
+                            has_positive = use_simcse or use_imix or (len(set(ds_ids)) < len(ds_ids)) or \
+                                           (level == "hierarchical" and len(set(cat_ids)) < len(cat_ids))
+                            con_term = None
+                            if has_positive:
+                                if use_imix:
+                                    embeds = []
+                                    for s in samples_in_batch:
+                                        gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
+                                        go = gpt2_model(**gi, use_cache=False)
+                                        embeds.append(go.last_hidden_state[:, -1, :])
+                                    feats_orig = torch.cat(embeds, dim=0)
+                                    B = feats_orig.shape[0]
+                                    perm = torch.randperm(B, device=device)
+                                    alpha_ = torch.distributions.Beta(imix_alpha, imix_alpha).sample([B, 1]).to(device)
+                                    feats = alpha_ * feats_orig + (1 - alpha_) * feats_orig[perm]
+                                    n_ds = len(unique_names)
+                                    y_oh_ds = torch.nn.functional.one_hot(
+                                        torch.tensor(ds_ids, device=device), n_ds
+                                    ).float()
+                                    y_mix_ds = alpha_ * y_oh_ds + (1 - alpha_) * y_oh_ds[perm]
+                                    if level == "hierarchical":
+                                        n_cat = len(cat_to_id)
+                                        y_oh_cat = torch.nn.functional.one_hot(
+                                            torch.tensor(cat_ids, device=device), n_cat
+                                        ).float()
+                                        y_mix_cat = alpha_ * y_oh_cat + (1 - alpha_) * y_oh_cat[perm]
+                                        if self.args.imix_key_mode == "clean":
+                                            con_ds = soft_cross_supcon_loss(
+                                                feats,
+                                                feats_orig,
+                                                y_mix_ds,
+                                                y_oh_ds,
+                                                temperature=contrast_temperature,
+                                            )
+                                            con_cat = soft_cross_supcon_loss(
+                                                feats,
+                                                feats_orig,
+                                                y_mix_cat,
+                                                y_oh_cat,
+                                                temperature=contrast_temperature,
+                                            )
+                                        else:
+                                            con_ds = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
+                                            con_cat = soft_supcon_loss(feats, y_mix_cat, temperature=contrast_temperature)
+                                        con_term = con_ds + hierarchical_beta * con_cat
                                     else:
-                                        sample_loss += template_loss
-                                epoch_train_correct += (preds == true_id).sum().item()
-                                epoch_train_total += 1
+                                        if self.args.imix_key_mode == "clean":
+                                            con_term = soft_cross_supcon_loss(
+                                                feats,
+                                                feats_orig,
+                                                y_mix_ds,
+                                                y_oh_ds,
+                                                temperature=contrast_temperature,
+                                            )
+                                        else:
+                                            con_term = soft_supcon_loss(feats, y_mix_ds, temperature=contrast_temperature)
+                                elif use_simcse:
+                                    embeds_a, embeds_b = [], []
+                                    for s in samples_in_batch:
+                                        gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
+                                        go_a = gpt2_model(**gi, use_cache=False)
+                                        go_b = gpt2_model(**gi, use_cache=False)
+                                        embeds_a.append(go_a.last_hidden_state[:, -1, :])
+                                        embeds_b.append(go_b.last_hidden_state[:, -1, :])
+                                    feats = torch.cat(embeds_a + embeds_b, dim=0)
+                                    lbls = torch.tensor(ds_ids + ds_ids, device=device)
+                                    con_term = supcon_loss(feats, lbls, temperature=contrast_temperature)
+                                else:
+                                    embeds = []
+                                    for s in samples_in_batch:
+                                        gi = gpt2_tokenizer(s[0], return_tensors="pt").to(device)
+                                        go = gpt2_model(**gi, use_cache=False)
+                                        embeds.append(go.last_hidden_state[:, -1, :])
+                                    feats = torch.cat(embeds, dim=0)
+                                    if level == "hierarchical":
+                                        ds_lbls = torch.tensor(ds_ids, device=device)
+                                        cat_lbls = torch.tensor(cat_ids, device=device)
+                                        con_ds = supcon_loss(feats, ds_lbls, temperature=contrast_temperature)
+                                        con_cat = supcon_loss(feats, cat_lbls, temperature=contrast_temperature)
+                                        con_term = con_ds + hierarchical_beta * con_cat
+                                    else:
+                                        lbls = torch.tensor(ds_ids, device=device)
+                                        con_term = supcon_loss(feats, lbls, temperature=contrast_temperature)
+                                if con_term is not None and con_term.requires_grad:
+                                    (lambda_now * con_term).backward()
+                                    total_contrast_loss += float(con_term.item())
 
-                            batch_loss += sample_loss / len(valid_templates)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        n_steps += 1
 
-                        if use_gradient_checkpointing:
-                            backward_done = True
+                        samples_in_batch.clear()
+                        sample_count = 0
 
-                    if loss is None:
-                        loss = batch_loss / B
-                    if not backward_done:
-                        loss.backward()
-                    optimizer.step()
-                    total_loss += loss.detach().item() * B
-
-                avg_train_loss = total_loss / len(train_data)
+                avg_ce_loss = total_ce_loss / max(len(train_data), 1)
+                avg_contrast_loss = total_contrast_loss / max(n_steps, 1)
+                avg_train_loss = avg_ce_loss + lambda_now * avg_contrast_loss
                 train_loss_lst.append(avg_train_loss)
 
                 avg_train_token_acc = epoch_train_correct / epoch_train_total
 
-                print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Train Token Acc: {avg_train_token_acc:.4f}")
+                if use_contrast:
+                    print(f"Epoch {epoch + 1}/{num_epochs}, λ={lambda_now:.3f}, Train Loss: {avg_train_loss:.4f} (CE: {avg_ce_loss:.4f}, SupCon: {avg_contrast_loss:.4f}), Train Token Acc: {avg_train_token_acc:.4f}")
+                else:
+                    print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Train Token Acc: {avg_train_token_acc:.4f}")
 
                 # Validation
                 gpt2_model.eval()
@@ -1347,126 +1574,21 @@ class Retrieve_Evaluator:
                 epoch_val_total = 0
 
                 with torch.no_grad():
-                    for batch_start in range(0, len(val_data), batch_size):
-                        batch_end = min(batch_start + batch_size, len(val_data))
-                        current_batch = val_data[batch_start:batch_end]
-                        B = len(current_batch)
-
-                        # 1. Batched GPT-2 forward
-                        gpt2_texts = [item[0] for item in current_batch]
-                        gpt2_inputs = gpt2_tokenizer(gpt2_texts, return_tensors="pt", padding=True).to(device)
-                        gpt2_outputs = gpt2_model(**gpt2_inputs)
-                        gpt2_lengths = gpt2_inputs.attention_mask.sum(dim=1) - 1
-                        gpt2_last_tokens = gpt2_outputs.last_hidden_state[torch.arange(B), gpt2_lengths]
-
-                        # 2. Batched projection
-                        projected_vectors = projection_layer(gpt2_last_tokens)
-                        all_layer_vectors = projected_vectors.view(B, llama_num_layers, llama_hidden_size)
-
-                        # 3. LLaMA forward with intervention
-                        if self.args.llama_batch:
-                            # Batched
-                            all_combined_texts = []
-                            all_prompt_lens = []
-                            all_n_templates = []
-
-                            for sample_idx in range(B):
-                                vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
-                                valid_templates = [t for t in templates if t is not None]
-                                if not valid_templates:
-                                    valid_templates = [None]
-                                all_n_templates.append(len(valid_templates))
-
-                                for template in valid_templates:
-                                    inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                                    combined_text = inference_query_text + target_text
-                                    prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids
-                                    all_combined_texts.append(combined_text)
-                                    all_prompt_lens.append(prompt_ids.shape[1])
-
-                            N = len(all_combined_texts)
-                            llama_inputs = llama_tokenizer(all_combined_texts, return_tensors="pt", padding=True).to(device)
-
-                            labels = llama_inputs.input_ids.clone()
-                            pad_lens = (llama_inputs.attention_mask == 0).sum(dim=1)
-                            for i in range(N):
-                                labels[i, :pad_lens[i] + all_prompt_lens[i]] = -100
-
-                            expanded_vectors = all_layer_vectors.repeat_interleave(
-                                torch.tensor(all_n_templates, device=device), dim=0)
-
-                            edit_layers = list(range(self.model_config["n_layers"]))
-                            intervention_fn = add_function_vector(edit_layers, expanded_vectors,
-                                device=self.model.device, idx=-1,
-                                weight_fv=self.args.weight_fv, weight_ori=self.args.weight_ori, norm=False)
-
-                            with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn, retain_output=False):
-                                outputs = llama_model(**llama_inputs, **self.forward_kwargs(logits_to_keep=False))
-
-                            logits = outputs.logits
-                            vocab_size = logits.size(-1)
-                            shift_logits = logits[:, :-1, :].contiguous()
-                            shift_labels = labels[:, 1:].contiguous()
-
-                            ce = F.cross_entropy(
-                                shift_logits.view(-1, vocab_size), shift_labels.view(-1),
-                                ignore_index=-100, reduction='none').view(N, -1)
-                            valid_tokens = (shift_labels != -100).float()
-                            per_seq_loss = (ce * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1)
-
-                            acc_positions = pad_lens + torch.tensor(all_prompt_lens, device=device) - 1
-                            label_positions = pad_lens + torch.tensor(all_prompt_lens, device=device)
-                            next_token_logits = logits[torch.arange(N, device=device), acc_positions]
-                            true_ids = labels[torch.arange(N, device=device), label_positions]
-                            epoch_val_correct += (next_token_logits.argmax(dim=-1) == true_ids).sum().item()
-                            epoch_val_total += N
-
-                            offset = 0
-                            for sample_idx in range(B):
-                                nt = all_n_templates[sample_idx]
-                                total_val_loss += per_seq_loss[offset:offset + nt].sum() / nt
-                                offset += nt
-
-                        else:
-                            # Sequential (original behavior)
-                            for sample_idx in range(B):
-                                vector_input_text, target_text, word_pairs_test, templates = current_batch[sample_idx]
-                                layer_vectors = all_layer_vectors[sample_idx]
-
-                                batch_val_loss = 0.0
-                                valid_templates = [t for t in templates if t is not None]
-                                if not valid_templates:
-                                    valid_templates = [None]
-
-                                for template in valid_templates:
-                                    inference_query_text, _ = self.prepare_query_text(word_pairs_test, template)
-                                    combined_text = inference_query_text + target_text
-
-                                    llama_inputs = llama_tokenizer(combined_text, return_tensors="pt").to(device)
-                                    input_ids = llama_inputs.input_ids
-                                    prompt_ids = llama_tokenizer(inference_query_text, return_tensors="pt").input_ids.to(device)
-                                    prompt_len = prompt_ids.shape[1]
-
-                                    labels = input_ids.clone()
-                                    labels[:, :prompt_len] = -100
-                                    llama_inputs["labels"] = labels
-
-                                    edit_layers = list(range(self.model_config["n_layers"]))
-                                    intervention_fn, _ = self.create_intervention_function(edit_layers, layer_vectors)
-
-                                    with TraceDict(llama_model, layers=self.model_config['layer_hook_names'], edit_output=intervention_fn, retain_output=False):
-                                        outputs = llama_model(**llama_inputs, **self.forward_kwargs(logits_to_keep=False))
-
-                                    batch_val_loss += outputs.loss
-
-                                    logits = outputs.logits
-                                    next_token_logits = logits[:, prompt_len-1, :]
-                                    preds = next_token_logits.argmax(dim=-1)
-                                    true_id = llama_inputs["labels"][:, prompt_len]
-                                    epoch_val_correct += (preds == true_id).sum().item()
-                                    epoch_val_total += 1
-
-                                total_val_loss += batch_val_loss / len(valid_templates)
+                    for _, indices in sample_batches(list(range(len(val_data))), batch_size):
+                        current_batch = [val_data[i] for i in indices]
+                        texts = [item[0] for item in current_batch]
+                        gpt2_inputs = gpt2_tokenizer(
+                            texts if len(texts) > 1 else texts[0], return_tensors="pt", padding=True,
+                        ).to(device)
+                        projected_vectors = project_source(gpt2_model, gpt2_inputs, projection_layer)
+                        layer_vectors = projected_vectors.view(len(indices), llama_num_layers, llama_hidden_size)
+                        metrics = [0, 0]
+                        template_count = (1 if self.args.llama_batch else sum(
+                            len([t for t in item[3] if t is not None]) or 1 for item in current_batch))
+                        batch_val_loss = sum(template_losses(current_batch, layer_vectors, metrics)) / template_count
+                        total_val_loss += batch_val_loss
+                        epoch_val_correct += metrics[0]
+                        epoch_val_total += metrics[1]
 
                     avg_val_loss = total_val_loss / len(val_data)
                     val_loss_lst.append(avg_val_loss)
@@ -1475,23 +1597,25 @@ class Retrieve_Evaluator:
 
                     print(f"Epoch {epoch + 1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}, Validation Token Acc: {avg_val_token_acc:.4f}")
 
-                    checkpoint = {
-                        'epoch': epoch,
-                        'gpt2_model_state_dict': gpt2_model.state_dict(),
-                        'projection_layer_state_dict': projection_layer.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loss': avg_train_loss,
-                        'val_loss': avg_val_loss,
-                    }
-
-                    if self.args.save_model or epoch + 1 == 10:
-                        os.makedirs(self.args.save_dir, exist_ok=True)
-                        torch.save(checkpoint, os.path.join(self.args.save_dir, f'best_model_epoch_{epoch+1}.pt'))
-                        print(f"Saved model at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
-
-        os.makedirs(self.args.save_dir, exist_ok=True)
-        torch.save(checkpoint, os.path.join(self.args.save_dir, f'best_model_epoch.pt'))
-        print(f"Saved model at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
+                    if self.args.last_mean:
+                        checkpoint = build_last_mean_checkpoint(
+                            gpt2_model, projection_layer, config, epoch + 1,
+                            train_loss=avg_train_loss, val_loss=avg_val_loss,
+                            train_token_acc=avg_train_token_acc, val_token_acc=avg_val_token_acc)
+                    else:
+                        checkpoint = {
+                            "epoch": epoch, "gpt2_model_state_dict": gpt2_model.state_dict(),
+                            "projection_layer_state_dict": projection_layer.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "train_loss": avg_train_loss, "val_loss": avg_val_loss,
+                        }
+                    if is_better_validation_candidate(
+                        avg_val_token_acc, float(avg_val_loss), best_val_token_acc, best_val_loss):
+                        best_val_token_acc, best_val_loss = avg_val_token_acc, float(avg_val_loss)
+                        atomic_torch_save(checkpoint, os.path.join(self.args.save_dir, "best_model_epoch.pt"))
+                        print(f"Saved best validation checkpoint at epoch {epoch + 1}")
+                    if self.args.save_model or epoch + 1 == num_epochs:
+                        atomic_torch_save(checkpoint, os.path.join(self.args.save_dir, f"model_epoch_{epoch + 1}.pt"))
 
         end_time = time.time()
         training_time = end_time - start_time
@@ -1552,7 +1676,43 @@ if __name__ == "__main__":
     parser.add_argument("--llama_batch", action='store_true', help="Batch LLaMA forward (batch_size * n_templates at once). Faster but fp16 numerical diff")
     parser.add_argument("--logits_to_keep", action='store_true', help="Pass logits_to_keep=1 where the code only needs last-token logits. Adaptive training loss keeps full logits to preserve the original objective.")
     parser.add_argument("--gradient_checkpointing", action='store_true', help="Enable LLaMA gradient checkpointing during adaptive training. Saves memory by recomputing LLaMA activations during backward.")
+    parser.add_argument("--train_datasets", type=str, default=None,
+                        help="Comma-separated dataset list to train on. Overrides default 20-dataset mix.")
+    # Contrastive on GPT-2 hidden
+    parser.add_argument("--use_contrastive", action='store_true',
+                        help="Add SupCon loss on GPT-2 last_hidden_state with dataset label as class.")
+    parser.add_argument("--contrastive_lambda", type=float, default=1.0,
+                        help="Weight of SupCon loss.")
+    parser.add_argument("--contrastive_temperature", type=float, default=0.1,
+                        help="SupCon temperature τ.")
+    parser.add_argument("--contrastive_batch_size", type=int, default=32,
+                        help="Number of samples accumulated per optimizer step (must contain multiple datasets).")
+    parser.add_argument("--contrastive_level", type=str, default="dataset",
+                        choices=["dataset", "category", "hierarchical"],
+                        help="'dataset' (~20 classes), 'category' (5 task-categories), or 'hierarchical' (both, weighted by --hierarchical_beta).")
+    parser.add_argument("--hierarchical_beta", type=float, default=0.5,
+                        help="Weight of category-level SupCon when level=hierarchical. dataset-level uses weight 1.0.")
+    parser.add_argument("--use_proj_head", action='store_true',
+                        help="Add small MLP projection head (768→768→128) before SupCon. Discarded at inference.")
+    parser.add_argument("--proj_head_dim", type=int, default=128,
+                        help="Output dim of projection head when --use_proj_head.")
+    parser.add_argument("--contrastive_lambda_end", type=float, default=None,
+                        help="Final λ; linearly anneals from --contrastive_lambda to this over epochs. None = no anneal.")
+    parser.add_argument("--use_simcse", action='store_true',
+                        help="Augment SupCon with SimCSE-style self-positives via two dropout forwards per sample.")
+    parser.add_argument("--use_imix", action='store_true',
+                        help="Apply manifold mixup on GPT-2 hidden + soft SupCon (i-Mix style).")
+    parser.add_argument("--imix_alpha", type=float, default=0.2,
+                        help="Beta distribution parameter for mixing coefficient (Beta(α, α)). Smaller→more extreme mixes.")
+    parser.add_argument("--bias_free_projection", action='store_true',
+                        help="Use Linear(..., bias=False) for projection layer.")
 
+    parser.add_argument("--last_mean", action="store_true", help="Use the final Joint-256 Last-Mean model with GPT-2 LoRA.")
+    parser.add_argument("--readout_mean_alpha", type=float, default=0.7)
+    parser.add_argument("--gpt2_model_name", default="gpt2")
+    parser.add_argument("--gpt2_learning_rate", type=float, default=8e-4)
+    parser.add_argument("--imix_key_mode", choices=["clean", "mixed"], default="mixed")
+    parser.add_argument("--train_only", action="store_true", help="Train and validate without test evaluation.")
     args = parser.parse_args()
     seed_everything(seed=args.seed)
     output_file = f"{args.save_dir}/{args.model_name.split('/')[-1]}_{args.dataset_name}_{args.retrieve_method}_{args.shots}shots_{args.weight_ori}ori_{args.weight_fv}fv_{args.recall}recall.json"
@@ -1561,5 +1721,6 @@ if __name__ == "__main__":
         assert False
 
     evaluator = Retrieve_Evaluator(args)
-    results = evaluator.evaluate()
-    evaluator.save_results(results)
+    if not args.train_only:
+        results = evaluator.evaluate()
+        evaluator.save_results(results)

@@ -61,7 +61,7 @@ def plot_tensor_distributions(tensor1, tensor2, name1="Tensor 1", name2="Tensor 
 
 def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weight_fv=1.0, weight_ori=0, norm=False):
     """
-    Adds a vector to the output of a specified layer in the model.
+    Adds a vector only at token position idx in the selected layers.
 
     Supports batched fv_vector:
       - [n_layers, hidden] : single sample (original behavior)
@@ -71,55 +71,42 @@ def add_function_vector(edit_layer, fv_vector, device, idx=-1, plot=False, weigh
     add_act: a function specifying how to add a function vector to a layer's output hidden states
     """
     def add_act(output, layer_name):
-        nonlocal edit_layer, fv_vector
         current_layer = int(layer_name.split(".")[2])
-        if isinstance(edit_layer, int):
-            edit_layer = [edit_layer]
-
-        batched = fv_vector.dim() == 3  # [B, n_layers, hidden]
-
-        if len(edit_layer) > 1:
-            if batched:
-                intert_fv = fv_vector[:, current_layer, :].unsqueeze(1).clone()  # [B, 1, hidden]
-            else:
-                intert_fv = fv_vector[current_layer].unsqueeze(0).clone()  # [1, hidden]
-        else:
-            intert_fv = fv_vector.clone()
-        # fv all layers [32, 4096] or [B, 32, 4096]
-        # one layer [1, 4096]
-        if current_layer in edit_layer:
-            if isinstance(output, tuple):
-                if plot:
-                    plot_tensor_distributions(output[0][:, idx], intert_fv.to(output[0].device), "Original", "Function Vector", save_name=f"{edit_layer}")
-                if norm:
-                    original_vector = output[0][:, idx].clone()
-                    original_norm = torch.norm(original_vector, p=2, dim=-1)
-                    updated_vector = weight_ori * original_vector + weight_fv * intert_fv.to(output[0].device)
-                    updated_norm = torch.norm(updated_vector, p=2, dim=-1)
-                    normalized_vector = updated_vector * (original_norm / updated_norm)
-                    output[0][:, idx] = normalized_vector
-                else:
-                    # output[0][:, idx] = weight_ori * output[0][:, idx] + weight_fv * intert_fv.to(output[0].device) #
-
-                    current_vector_casted = intert_fv.to(output[0].dtype)
-                    new_hidden = output[0] + weight_fv * current_vector_casted.to(output[0].device)
-                    return (new_hidden,) + output[1:]
-
-                return output
-            else: # MAMBA
-                if norm:
-                    original_vector = output[:, idx].clone()
-                    original_norm = torch.norm(original_vector, p=2, dim=-1)
-                    updated_vector = weight_ori * original_vector + weight_fv * intert_fv.to(output.device)
-                    updated_norm = torch.norm(updated_vector, p=2, dim=-1)
-                    normalized_vector = updated_vector * (original_norm / updated_norm)
-                    output[:, idx] = normalized_vector
-                else:
-                    output[:, idx] =  weight_ori * output[:, idx] + weight_fv * intert_fv .to(output.device) #intert_fv.to(output.device)
-
-                return output
-        else:
+        edit_layers = [edit_layer] if isinstance(edit_layer, int) else edit_layer
+        if current_layer not in edit_layers:
             return output
+
+        hidden = output[0] if isinstance(output, tuple) else output
+        if fv_vector.dim() == 3:
+            vector_layer = current_layer if fv_vector.shape[1] > 1 else 0
+            vector = fv_vector[:, vector_layer, :]
+        elif len(edit_layers) > 1:
+            vector = fv_vector[current_layer].unsqueeze(0)
+        else:
+            vector = fv_vector
+        vector = vector.to(device=hidden.device, dtype=hidden.dtype)
+
+        if torch.is_tensor(idx):
+            positions = idx.to(device=hidden.device, dtype=torch.long)
+            rows = torch.arange(hidden.shape[0], device=hidden.device)
+            original = hidden[rows, positions]
+        else:
+            original = hidden[:, idx]
+
+        if plot:
+            plot_tensor_distributions(original, vector, "Original", "Function Vector", save_name=f"{edit_layers}")
+        updated = weight_ori * original + weight_fv * vector
+        if norm:
+            original_norm = torch.norm(original, p=2, dim=-1, keepdim=True)
+            updated_norm = torch.norm(updated, p=2, dim=-1, keepdim=True)
+            updated = updated * (original_norm / updated_norm.clamp_min(torch.finfo(updated.dtype).tiny))
+
+        new_hidden = hidden.clone()
+        if torch.is_tensor(idx):
+            new_hidden[rows, positions] = updated
+        else:
+            new_hidden[:, idx] = updated
+        return (new_hidden,) + output[1:] if isinstance(output, tuple) else new_hidden
     return add_act
 
 @torch.no_grad()

@@ -1,4 +1,5 @@
 import torch
+from utils.last_mean import CHECKPOINT_FORMAT, project_source, load_last_mean_checkpoint
 import torch.nn.functional as F
 import numpy as np
 from cuml.manifold import TSNE as cumlTSNE
@@ -36,6 +37,20 @@ from baukit import TraceDict
 import numpy as np
 
 MAX_NEW_TOKENS = 256
+
+CATEGORY_SUBTRACT_GROUP_DATASETS = {
+    "nlu": ["superglue_rte", "superglue_wic", "glue_qnli", "glue_sst2", "glue_mnli"],
+    "reasoning": [
+        "arc_challenge",
+        "bbh_boolean_expressions",
+        "bbh_date_understanding",
+        "bbh_reasoning_about_colored_objects",
+        "bbh_temporal_sequences",
+    ],
+    "knowledge": ["boolq", "commonsense_qa", "hellaswag", "openbookqa"],
+    "math": ["math_qa", "mmlu_pro_math"],
+    "safety": ["bbq_age", "crows_pairs", "ethics_justice", "ethics_commonsense"],
+}
 
 def test_answer(pred_str, ans, natural_prompt):
     try:
@@ -267,12 +282,22 @@ class Retrieve_Evaluator:
         self.model, self.tokenizer, self.model_config = self.load_model()
         self.dataset = self.load_dataset()
         self.answer_templates = ["Answer:", "The answer is", "A:"]
+        self.category_subtract_group_datasets = dict(CATEGORY_SUBTRACT_GROUP_DATASETS)
+        self.category_subtract_selection = None
+        self.category_subtract_mean_vector = None
+        self.category_subtract_group_name = None
+        self.category_subtract_layer_indices = None
+        self.apply_category_subtract_selection()
 
         #! adaptive ICV
         if self.args.single_layer_mode == False:
             self.gpt_2_tokenizer, self.gpt2_model, self.projection_layer = self.load_trained_models()
             self.threshold = 0.001
+            self.category_subtract_layer_indices = self.parse_category_subtract_layers()
+            self.category_subtract_mean_vector = self.build_category_subtract_mean_vector()
         else:
+            if self.category_subtract_requested():
+                raise ValueError("Category subtraction is only implemented for adaptive all-layer evaluation.")
             self.state_db = self.load_state_db()
 
     def load_model(self):
@@ -545,13 +570,10 @@ class Retrieve_Evaluator:
                 results["clean_time_list"].append(clean_time / B)
 
             # 2. Batched GPT-2 adaptive retrieval
-            gpt2_inputs = self.gpt_2_tokenizer(batch_query_texts, return_tensors="pt", padding=True).to(self.model.device)
-            gpt2_outputs = self.gpt2_model(**gpt2_inputs)
-            gpt2_lengths = gpt2_inputs.attention_mask.sum(dim=1) - 1
-            gpt2_last_tokens = gpt2_outputs.last_hidden_state[torch.arange(B), gpt2_lengths]  # [B, 768]
-
-            projected = self.projection_layer(gpt2_last_tokens)  # [B, n_layers*hidden]
+            gpt2_inputs = self.gpt2_tokenize(batch_query_texts)
+            projected = project_source(self.gpt2_model, gpt2_inputs, self.projection_layer)
             all_layer_vectors = projected.view(B, self.model_config["n_layers"], self.model_config["hidden_dim"])  # [B, 32, 4096]
+            all_layer_vectors = self.apply_category_subtraction(all_layer_vectors)
 
             # 3. Batched intervened inference
             edit_layers = list(range(self.model_config["n_layers"]))
@@ -1061,15 +1083,289 @@ class Retrieve_Evaluator:
             for k,v in results["bm25_results"].items()
         }
 
+    ####################### Category subtraction #######################
+
+    def category_subtract_requested(self):
+        return (
+            bool(getattr(self.args, "category_subtract_selection_file", None))
+            or bool(getattr(self.args, "category_subtract_group_spec", None))
+            or float(getattr(self.args, "category_subtract_beta", 0.0)) != 0.0
+        )
+
+    def apply_category_subtract_selection(self):
+        selection_file = getattr(self.args, "category_subtract_selection_file", None)
+        if not selection_file:
+            return
+        with open(selection_file, "r") as f:
+            config = json.load(f)
+
+        self.category_subtract_group_datasets.update(config.get("groups", {}))
+        defaults = config.get("defaults", {})
+        for key, attr in [
+            ("variant", "category_subtract_variant"),
+            ("n", "category_subtract_n"),
+            ("split", "category_subtract_split"),
+            ("template_mode", "category_subtract_template_mode"),
+            ("template_idx", "category_subtract_template_idx"),
+            ("batch_size", "category_subtract_batch_size"),
+        ]:
+            if key in defaults:
+                setattr(self.args, attr, defaults[key])
+
+        datasets = config.get("datasets", {})
+        if self.args.dataset_name not in datasets:
+            raise ValueError(
+                f"{selection_file} has no category subtraction entry for dataset "
+                f"{self.args.dataset_name}"
+            )
+
+        entry = datasets[self.args.dataset_name]
+        self.category_subtract_selection = entry
+        self.args.category_subtract_group_spec = self.category_subtract_entry_to_spec(entry)
+        self.args.category_subtract_beta = float(entry.get("beta", self.args.category_subtract_beta))
+        self.args.category_subtract_layers = str(entry.get("layers", self.args.category_subtract_layers))
+        self.args.category_subtract_variant = entry.get("variant", self.args.category_subtract_variant)
+        if "n" in entry:
+            self.args.category_subtract_n = int(entry["n"])
+        if "split" in entry:
+            self.args.category_subtract_split = entry["split"]
+        if "template_mode" in entry:
+            self.args.category_subtract_template_mode = entry["template_mode"]
+        if "template_idx" in entry:
+            self.args.category_subtract_template_idx = int(entry["template_idx"])
+        if "batch_size" in entry:
+            self.args.category_subtract_batch_size = int(entry["batch_size"])
+
+    def category_subtract_entry_to_spec(self, entry):
+        if entry.get("group_spec"):
+            return entry["group_spec"]
+        group_name = entry.get("group_name") or entry.get("group") or entry.get("source")
+        datasets = entry.get("datasets")
+        if datasets:
+            if isinstance(datasets, str):
+                datasets = [datasets]
+            return f"{group_name}={','.join(datasets)}" if group_name else ",".join(datasets)
+        if not group_name:
+            raise ValueError(f"Invalid category subtraction selection entry: {entry}")
+        return group_name
+
+    def split_category_subtract_spec_text(self, spec):
+        if "=" in spec:
+            group_name, dataset_text = spec.split("=", 1)
+            return group_name.strip() or "background", dataset_text.strip()
+        return spec.strip() or "background", spec.strip()
+
+    def parse_category_subtract_group_parts(self, spec):
+        if not spec:
+            return None, []
+        group_name, dataset_text = self.split_category_subtract_spec_text(spec)
+        if "+" in dataset_text:
+            parts = [item.strip() for item in dataset_text.split("+") if item.strip()]
+            return group_name, [self.parse_category_subtract_weighted_part(part) for part in parts]
+        if "," not in dataset_text and dataset_text in self.category_subtract_group_datasets:
+            return group_name, [(dataset_text, self.category_subtract_group_datasets[dataset_text], 1.0)]
+        datasets = [item.strip() for item in dataset_text.split(",") if item.strip()]
+        return group_name, [(group_name, datasets, 1.0)]
+
+    def parse_category_subtract_weighted_part(self, part):
+        weight = 1.0
+        name = part.strip()
+        if "@" in name:
+            name, weight_text = [item.strip() for item in name.rsplit("@", 1)]
+            weight = float(weight_text)
+        elif ":" in name:
+            name_text, weight_text = [item.strip() for item in name.rsplit(":", 1)]
+            try:
+                weight = float(weight_text)
+                name = name_text
+            except ValueError:
+                pass
+        if weight < 0:
+            raise ValueError(f"Category source weights must be non-negative: {part}")
+        if name in self.category_subtract_group_datasets:
+            return name, self.category_subtract_group_datasets[name], weight
+        return name, [name], weight
+
+    def parse_category_subtract_layers(self):
+        spec = getattr(self.args, "category_subtract_layers", "all") or "all"
+        spec = spec.strip().lower()
+        if spec in {"all", "*"}:
+            return None
+        n_layers = self.model_config["n_layers"]
+        indices = set()
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_text, end_text = part.split("-", 1)
+                start = int(start_text)
+                end = int(end_text)
+                if start > end:
+                    raise ValueError(f"Invalid category_subtract_layers range: {part}")
+                indices.update(range(start, end + 1))
+            else:
+                indices.add(int(part))
+        invalid = [idx for idx in sorted(indices) if idx < 0 or idx >= n_layers]
+        if invalid:
+            raise ValueError(
+                f"category_subtract_layers has invalid layer(s) {invalid}; "
+                f"valid range is 0-{n_layers - 1}"
+            )
+        selected = sorted(indices)
+        print(f"Category subtraction layer mask: {selected}")
+        return selected
+
+    def load_category_subtract_templates(self, dataset_name):
+        if not self.args.prompt_file:
+            return [None]
+        with open(self.args.prompt_file, "r") as f:
+            natural_texts = json.load(f)
+        base_templates = natural_texts[dataset_name]
+        mode = self.args.category_subtract_template_mode
+        if mode == "single_base":
+            return [base_templates[min(self.args.category_subtract_template_idx, len(base_templates) - 1)]]
+        if mode == "base3":
+            return list(base_templates)
+        if mode == "training3":
+            return [template + "\nA:" for template in base_templates]
+        if mode == "eval9":
+            return [template + "\n" + answer for answer in self.answer_templates for template in base_templates]
+        raise ValueError(f"Unknown category_subtract_template_mode: {mode}")
+
+    def build_category_subtract_prompt(self, item, template):
+        word_pairs = {'input': [], 'output': []}
+        if template:
+            prefixes = {"instructions": '', "input": '', "output": ''}
+            separators = {"instructions": '', "input": '', "output": ''}
+            prompt_data = word_pairs_to_prompt_data(
+                word_pairs,
+                query_target_pair=item,
+                prepend_bos_token=False,
+                shuffle_labels=False,
+                template=template,
+                cot=False,
+                prefixes=prefixes,
+                separators=separators,
+                prepend_space=False,
+            )
+        else:
+            prompt_data = word_pairs_to_prompt_data(
+                word_pairs,
+                query_target_pair=item,
+                prepend_bos_token=False,
+                shuffle_labels=False,
+                cot=False,
+                prepend_space=True,
+            )
+        return create_prompt(prompt_data, tokenizer=self.tokenizer if "instruct" in self.args.model_name else None)
+
+    def build_category_subtract_mean_vector(self):
+        beta = float(getattr(self.args, "category_subtract_beta", 0.0))
+        spec = getattr(self.args, "category_subtract_group_spec", None)
+        variant = getattr(self.args, "category_subtract_variant", "mean")
+        if beta == 0.0 or not spec:
+            return None
+        if variant != "mean":
+            raise ValueError("Integrated category subtraction supports only variant='mean'.")
+        group_name, group_parts = self.parse_category_subtract_group_parts(spec)
+        if not group_parts:
+            return None
+        if len(group_parts) == 1:
+            part_name, datasets, _ = group_parts[0]
+            return self.build_category_subtract_mean_vector_for_group(part_name or group_name, datasets)
+
+        part_vectors = []
+        weights = []
+        for part_name, datasets, weight in group_parts:
+            part_vectors.append(self.build_category_subtract_mean_vector_for_group(part_name, datasets).detach())
+            weights.append(weight)
+        self.category_subtract_group_name = group_name
+        weight_tensor = torch.tensor(weights, dtype=torch.float32, device=part_vectors[0].device)
+        weight_tensor = (weight_tensor / weight_tensor.sum().clamp_min(1e-12)).view(-1, 1, 1)
+        mean_vector = (torch.stack(part_vectors, dim=0) * weight_tensor).sum(dim=0).to(self.model.device)
+        print(f"Category subtraction ensemble mean ready: group={group_name}, shape={tuple(mean_vector.shape)}")
+        return mean_vector
+
+    def build_category_subtract_mean_vector_for_group(self, group_name, datasets):
+        prompts = []
+        for dataset_name in datasets:
+            dataset = load_dataset(
+                dataset_name,
+                root_data_dir=self.args.root_data_dir,
+                test_split=self.args.test_split,
+                seed=self.args.seed,
+            )
+            split = self.args.category_subtract_split
+            if split not in dataset:
+                raise ValueError(f"{dataset_name} has no split {split} for category subtraction.")
+            split_data = dataset[split]
+            sample_n = min(len(split_data.raw_data), self.args.category_subtract_n)
+            sampled = split_data.raw_data.sample(n=sample_n, random_state=self.args.seed)
+            templates = self.load_category_subtract_templates(dataset_name)
+            for _, row in sampled.iterrows():
+                item = row.to_dict()
+                for template in templates:
+                    prompts.append(self.build_category_subtract_prompt(item, template))
+
+        if not prompts:
+            raise ValueError("Category subtraction requested, but no background prompts were built.")
+
+        print(
+            f"Building category subtraction mean: group={group_name}, datasets={datasets}, "
+            f"prompts={len(prompts)}, beta={self.args.category_subtract_beta}"
+        )
+        vectors = []
+        batch_size = self.args.category_subtract_batch_size
+        with torch.no_grad():
+            for batch_start in tqdm(range(0, len(prompts), batch_size), desc="category_subtract_mean"):
+                batch_prompts = prompts[batch_start:batch_start + batch_size]
+                inputs = self.gpt2_tokenize(batch_prompts)
+                projected = project_source(self.gpt2_model, inputs, self.projection_layer)
+                layer_vectors = projected.view(
+                    len(batch_prompts),
+                    self.model_config["n_layers"],
+                    self.model_config["hidden_dim"],
+                )
+                vectors.append(layer_vectors.detach().cpu())
+
+        self.category_subtract_group_name = group_name
+        mean_vector = torch.cat(vectors, dim=0).mean(dim=0).to(self.model.device)
+        print(f"Category subtraction mean ready: shape={tuple(mean_vector.shape)}")
+        return mean_vector
+
+    def apply_category_subtract_layer_mask(self, direction):
+        if self.category_subtract_layer_indices is None:
+            return direction
+        masked = torch.zeros_like(direction)
+        masked[self.category_subtract_layer_indices] = direction[self.category_subtract_layer_indices]
+        return masked
+
+    def apply_category_subtraction(self, layer_vectors):
+        if self.category_subtract_mean_vector is None:
+            return layer_vectors
+        beta = self.args.category_subtract_beta
+        mean_vector = self.category_subtract_mean_vector.to(device=layer_vectors.device, dtype=layer_vectors.dtype)
+        mean_vector = self.apply_category_subtract_layer_mask(mean_vector)
+        direction = mean_vector.unsqueeze(0) if layer_vectors.dim() == 3 else mean_vector
+        return layer_vectors - beta * direction
+
+    def gpt2_tokenize(self, texts):
+        return self.gpt_2_tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.gpt2_model.config.n_positions,
+        ).to(self.model.device)
+
     ####################### Adaptive ICV #######################
 
     def adaptive_retrieval(self, query_text):
-        gpt2_inputs = self.gpt_2_tokenizer(query_text, return_tensors="pt").to(self.model.device)
-        gpt2_outputs = self.gpt2_model(**gpt2_inputs)
-        gpt2_last_token = gpt2_outputs.last_hidden_state[:, -1, :]
-
-        projected_vector = self.projection_layer(gpt2_last_token)
+        gpt2_inputs = self.gpt2_tokenize(query_text)
+        projected_vector = project_source(self.gpt2_model, gpt2_inputs, self.projection_layer)
         layer_vectors = projected_vector.view(self.model_config["n_layers"], self.model_config["hidden_dim"])
+        layer_vectors = self.apply_category_subtraction(layer_vectors)
 
         icl_best_layer = None
         disable = False
@@ -1080,10 +1376,19 @@ class Retrieve_Evaluator:
 
     def load_trained_models(self):
         print("Loading trained GPT-2 model and projection layer...")
+        self.tokenizer.padding_side = "left"
+        checkpoint = torch.load(self.args.trained_model_path, map_location="cpu", weights_only=False)
+        if checkpoint.get("checkpoint_format") == CHECKPOINT_FORMAT:
+            tokenizer = GPT2Tokenizer.from_pretrained(self.args.gpt2_model_name)
+            tokenizer.pad_token = tokenizer.eos_token
+            model, projection = load_last_mean_checkpoint(
+                checkpoint, self.args.gpt2_model_name, self.args.device,
+                self.model_config["n_layers"], self.model_config["hidden_dim"])
+            return tokenizer, model, projection
         # Load GPT-2 model and tokenizer
-        gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        gpt2_tokenizer = GPT2Tokenizer.from_pretrained(self.args.gpt2_model_name)
         gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
-        gpt2_model = GPT2Model.from_pretrained("gpt2").to(self.args.device)
+        gpt2_model = GPT2Model.from_pretrained(self.args.gpt2_model_name).to(self.args.device)
 
         # Initialize projection layer
         gpt2_hidden_size = gpt2_model.config.hidden_size
@@ -1092,7 +1397,6 @@ class Retrieve_Evaluator:
         projection_layer = nn.Linear(gpt2_hidden_size, llama_hidden_size * llama_num_layers).to(self.args.device)
 
         # Load trained weights
-        checkpoint = torch.load(self.args.trained_model_path)
         gpt2_model.load_state_dict(checkpoint['gpt2_model_state_dict'])
         projection_layer.load_state_dict(checkpoint['projection_layer_state_dict'])
 
@@ -1150,10 +1454,31 @@ if __name__ == "__main__":
     parser.add_argument("--shots", type=str, default=None)
     parser.add_argument("--test_samples", type=int, default=100)
     parser.add_argument("--n_layers", type=int, default=None)
+    parser.add_argument("--category_subtract_selection_file", type=str, default=None,
+                        help="JSON file with dataset-specific mean category subtraction settings")
+    parser.add_argument("--category_subtract_group_spec", type=str, default=None,
+                        help="Background source spec, e.g. knowledge or src_glue_qnli=glue_qnli")
+    parser.add_argument("--category_subtract_layers", type=str, default="all",
+                        help="Layers to subtract on, e.g. all, 4-25, or 0,4,8")
+    parser.add_argument("--category_subtract_beta", type=float, default=0.0,
+                        help="Mean category subtraction coefficient")
+    parser.add_argument("--category_subtract_variant", type=str, default="mean",
+                        help="Only mean is supported in the integrated path")
+    parser.add_argument("--category_subtract_n", type=int, default=90,
+                        help="Number of examples per source dataset for category mean construction")
+    parser.add_argument("--category_subtract_split", type=str, default="train",
+                        help="Dataset split used to construct the category mean")
+    parser.add_argument("--category_subtract_template_mode", type=str, default="training3",
+                        help="Prompt templates used to construct the category mean")
+    parser.add_argument("--category_subtract_template_idx", type=int, default=0,
+                        help="Base template index used when category_subtract_template_mode=single_base")
+    parser.add_argument("--category_subtract_batch_size", type=int, default=32,
+                        help="GPT-2 projection batch size for category mean construction")
 
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference (1 = original behavior)")
     parser.add_argument("--logits_to_keep", action='store_true', help="Pass logits_to_keep=1 for last-token-only logits. Saves memory but may introduce tiny numerical differences.")
+    parser.add_argument("--gpt2_model_name", default="gpt2")
     args = parser.parse_args()
     seed_everything(seed=args.seed)
     output_file = f"{args.save_dir}/{args.model_name.split('/')[-1]}_{args.dataset_name}_{args.retrieve_method}_{args.shots}shots_{args.weight_ori}ori_{args.weight_fv}fv_{args.recall}recall.json"
